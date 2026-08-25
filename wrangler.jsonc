@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zernio-social-inbox-agent",
+  "main": "worker.js",
+  "compatibility_date": "2025-06-01",
+
+  // KV namespace لتخزين: dedup الأحداث، كاش الأدوات المكتشفة، وسجل المتابعة.
+  // أنشئه أولًا بالأمر:
+  //   npx wrangler kv namespace create ZERNIO_KV
+  // وحط الـ id اللي هيطلعلك بدل "REPLACE_WITH_YOUR_KV_ID".
+  "kv_namespaces": [
+    {
+      "binding": "ZERNIO_KV",
+      "id": "REPLACE_WITH_YOUR_KV_ID"
+    }
+  ]
+
+  // الأسرار (لا تُكتب هنا خالص) تتحط بالأمر:
+  //   npx wrangler secret put ZERNIO_API_KEY
+  //   npx wrangler secret put ZERNIO_WEBHOOK_SECRET
+  //   npx wrangler secret put GEMINI_API_KEY
+  //   npx wrangler secret put STATUS_KEY        (اختياري)
+  //   npx wrangler secret put GEMINI_MODELS      (اختياري)
+  // أو من Cloudflare Dashboard → Workers → اسم الـ Worker → Settings →
+  // Variables and Secrets.
+}
