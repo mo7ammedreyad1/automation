@@ -34,7 +34,7 @@
 const MCP_URL = "https://mcp.zernio.com/mcp";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
-const DEFAULT_GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const DEFAULT_GEMINI_MODELS = ["gemini-3.0-flash", "gemini-3.5-flash"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const TOOLS_CACHE_TTL_SECONDS = 6 * 60 * 60; // 6 ساعات
