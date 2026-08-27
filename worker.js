@@ -44,7 +44,7 @@ const LOG_LIST_LIMIT = 30;
 
 // حد أقصى لعدد دورات Plan→Act→Reflect لكل حدث — حماية من التكلفة/التكرار
 // اللانهائي، مش قرار على مضمون الرد.
-const MAX_AGENT_STEPS = 6;
+const MAX_AGENT_STEPS = 8;
 
 // -----------------------------------------------------------------------------
 // 2) أدوات مساعدة عامة (JSON responses, hex, HMAC, KV wrappers)
@@ -109,14 +109,39 @@ async function logActivity(env, entry) {
   await kvSetJSON(env, `log:${isoNow()}:${shortId()}`, entry, LOG_TTL_SECONDS);
 }
 
-async function listRecentLogs(env, { limit = LOG_LIST_LIMIT, eventId = null } = {}) {
+// range=1h (آخر ساعة) أو range=today (من أول اليوم UTC) أو since=<ISO> مخصص.
+function computeSinceDate(url) {
+  const since = url.searchParams.get("since");
+  if (since) {
+    const d = new Date(since);
+    if (!isNaN(d)) return d;
+  }
+  const range = url.searchParams.get("range");
+  if (range === "1h") return new Date(Date.now() - 60 * 60 * 1000);
+  if (range === "today") {
+    const d = new Date();
+    d.setUTCHours(0, 0, 0, 0);
+    return d;
+  }
+  return null;
+}
+
+async function listRecentLogs(env, { limit = LOG_LIST_LIMIT, eventId = null, since = null } = {}) {
   try {
+    const needsWideScan = Boolean(eventId || since);
     const listRes = await env.ZERNIO_KV.list({ prefix: "log:", limit: 1000 });
     let keys = listRes.keys.map((k) => k.name).sort().reverse();
-    keys = keys.slice(0, eventId ? 500 : limit);
-    const entries = (await Promise.all(keys.map((k) => kvGetJSON(env, k)))).filter(Boolean);
-    const filtered = eventId ? entries.filter((e) => e.eventId === eventId) : entries;
-    return eventId ? filtered : filtered.slice(0, limit);
+    keys = keys.slice(0, needsWideScan ? 1000 : limit);
+
+    let entries = (await Promise.all(keys.map((k) => kvGetJSON(env, k)))).filter(Boolean);
+    if (eventId) entries = entries.filter((e) => e.eventId === eventId);
+    if (since) {
+      entries = entries.filter((e) => {
+        const t = new Date((e.timing && e.timing.receivedAt) || e.ts || 0);
+        return t >= since;
+      });
+    }
+    return needsWideScan ? entries : entries.slice(0, limit);
   } catch (err) {
     console.error("listRecentLogs failed", err);
     return [];
@@ -328,6 +353,8 @@ const AGENT_SYSTEM_INSTRUCTION = [
   "1. اقرا الحدث الخام اللي وصلك بعناية وافهم نوعه (تعليق، رسالة، أو أي حدث تاني) والمطلوب فعله، لو فيه حاجة أصلاً.",
   "2. لو الحدث لا يحتاج أي فعل (إشعار نشر منشور، تفاعل بسيط، حدث غير متعلق بالتفاعل مع عميل)، اكتفِ برد نصي قصير يشرح السبب من غير ما تنادي أي أداة.",
   "3. لو محتاج فعل فعلي، استخدم list_tools الأول. لو الأداة المناسبة مش ظاهرة فيها، نادِ call_tool بالاسم search_tools لتكتشفها (زي ما اتشرح فوق)، بعدين call_tool تاني بالاسم الحقيقي اللي لقيته لتنفيذها.",
+  "3ب. اربط نوع الأداة بشكل الحدث: لو الحدث الخام فيه conversationId (يعني رسالة/DM)، ممنوع تستخدم أي أداة اسمها فيها comments — دور بـ search_tools عن أداة اسمها فيها messages. لو الحدث فيه postId أو platformPostId من غير conversationId (يعني تعليق)، أدوات comments_* هي الصح.",
+  "3ج. لو نفس الأداة فشلت مرتين بأخطاء زي 'not found' أو 'invalid' أو 'platform_api_error'، الأغلب إنك مستخدم الأداة الغلط أصلاً، مش إن الـ IDs غلط. ارجع لـ search_tools بدل ما تكرر نفس الأداة بـ IDs مختلفة.",
   "4. استخدم الـ IDs الحقيقية الموجودة في نص الحدث بالظبط (مثل comment id، conversation id، account id) — لا تخترع أي قيمة غير موجودة في النص.",
   "5. لو نداء أداة رجع خطأ، اقرا رسالة الخطأ بعناية وصحّح الـ arguments أو جرّب أداة بديلة قبل ما تستسلم.",
   "6. لو بتصيغ ردًا فعليًا لعميل، اكتبه بنفس لغته (عربي فصحى أو عامية أو إنجليزي) وخليه ودود ومختصر ومحترف.",
@@ -338,7 +365,11 @@ const AGENT_SYSTEM_INSTRUCTION = [
 async function executeAgentFunction(env, sessionId, name, args) {
   if (name === "list_tools") {
     const tools = await getCachedToolsList(env, sessionId);
-    return JSON.stringify(tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })));
+    const toolsJson = JSON.stringify(tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })));
+    return (
+      toolsJson +
+      "\n\nملاحظة: دي الأدوات الأساسية بس. لو القدرة اللي محتاجها (زي إرسال رسالة خاصة/DM) مش ظاهرة هنا، نادِ call_tool بالاسم search_tools ومعاه query يوصف اللي محتاجه بالظبط."
+    );
   }
 
   if (name === "call_tool") {
@@ -373,7 +404,7 @@ async function runAgentLoop(env, sessionId, rawEventText) {
 
     if (!functionCalls.length) {
       const finalText = parts.filter((p) => p.text).map((p) => p.text).join("\n").trim();
-      steps.push({ step: i + 1, type: "final", text: finalText });
+      steps.push({ step: i + 1, ts: isoNow(), type: "final", text: finalText });
       return { steps, finalText, stopReason: "final" };
     }
 
@@ -387,7 +418,7 @@ async function runAgentLoop(env, sessionId, rawEventText) {
       } catch (err) {
         resultText = "خطأ فى التنفيذ: " + err.message;
       }
-      steps.push({ step: i + 1, type: "call", name: fc.name, args: fc.args, result: String(resultText).slice(0, 500) });
+      steps.push({ step: i + 1, ts: isoNow(), type: "call", name: fc.name, args: fc.args, result: String(resultText).slice(0, 500) });
       responseParts.push({ functionResponse: { name: fc.name, response: { result: resultText } } });
     }
     contents.push({ role: "function", parts: responseParts });
@@ -410,29 +441,58 @@ function isSelfEcho(payload) {
   return false;
 }
 
-async function handleZernioEvent(env, rawBody, payload) {
+// معاينة عامة بحتة (لغرض القراءة البشرية في اللوج فقط) — بتاخد حقول موجودة
+// في كل أنواع الأحداث (account.platform) + مقتطف من النص الخام، من غير أي
+// تصنيف أو استخراج حقول خاصة بنوع حدث معين (ده قرار الموديل، مش الكود).
+function buildTriggerPreview(payload, rawBody) {
+  return {
+    platform: (payload.account && payload.account.platform) || null,
+    preview: rawBody.length > 220 ? rawBody.slice(0, 220) + "…" : rawBody,
+  };
+}
+
+async function handleZernioEvent(env, rawBody, payload, receivedAt) {
   const eventId = payload.id;
   const eventType = payload.event;
+  const startedAt = isoNow();
+  const trigger = buildTriggerPreview(payload, rawBody);
 
   if (isSelfEcho(payload)) {
-    await logActivity(env, { ts: isoNow(), eventId, event: eventType, outcome: "skipped-self-echo" });
+    const finishedAt = isoNow();
+    await logActivity(env, {
+      eventId,
+      event: eventType,
+      trigger,
+      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+      outcome: "skipped-self-echo",
+    });
     return;
   }
 
   try {
     const sessionId = await mcpInitialize(env);
     const trace = await runAgentLoop(env, sessionId, rawBody);
+    const finishedAt = isoNow();
     await logActivity(env, {
-      ts: isoNow(),
       eventId,
       event: eventType,
+      trigger,
+      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
       outcome: trace.stopReason,
       finalText: trace.finalText,
       steps: trace.steps,
     });
   } catch (err) {
     console.error("handleZernioEvent failed", eventType, err);
-    await logActivity(env, { ts: isoNow(), eventId, event: eventType, outcome: "error", detail: err.message });
+    const finishedAt = isoNow();
+    await logActivity(env, {
+      eventId,
+      event: eventType,
+      trigger,
+      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+      outcome: "error",
+      error: err.message,
+    });
   }
 }
 
@@ -441,6 +501,7 @@ async function handleZernioEvent(env, rawBody, payload) {
 // -----------------------------------------------------------------------------
 
 async function handleWebhook(request, env, ctx) {
+  const receivedAt = isoNow();
   const rawBody = await request.text();
 
   const signature = request.headers.get("X-Zernio-Signature");
@@ -467,7 +528,7 @@ async function handleWebhook(request, env, ctx) {
 
   // لازم رد 2xx خلال 5 ثواني (وإلا Zernio تعيد المحاولة لغاية ~51 ساعة) —
   // فبنرجّع الرد فورًا، والمعالجة الفعلية (حلقة الوكيل) بتكمل في الخلفية.
-  ctx.waitUntil(handleZernioEvent(env, rawBody, payload));
+  ctx.waitUntil(handleZernioEvent(env, rawBody, payload, receivedAt));
 
   return jsonResponse({ ok: true });
 }
@@ -502,7 +563,8 @@ async function handleHealth(request, env) {
   }
 
   const eventId = url.searchParams.get("eventId");
-  const logs = await listRecentLogs(env, { eventId });
+  const since = computeSinceDate(url);
+  const logs = await listRecentLogs(env, { eventId, since });
 
   return jsonResponse({ ok: true, secrets, mcp, logs });
 }
