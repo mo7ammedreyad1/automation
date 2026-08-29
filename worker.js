@@ -34,7 +34,7 @@
 const MCP_URL = "https://mcp.zernio.com/mcp";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
-const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite", "gemini-3.0-flash"];
+const DEFAULT_GEMINI_MODELS = ["gemini-2.5-flash"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const TOOLS_CACHE_TTL_SECONDS = 6 * 60 * 60; // 6 ساعات
@@ -268,49 +268,34 @@ function buildGeminiCombos(env) {
   return combos;
 }
 
-// دورة واحدة من المحادثة (مش الحلقة الكاملة) — بترجع الـ parts الخام من رد
-// الموديل. لو اتبعتلها attemptsLog (array)، بتسجل فيه كل محاولة (موديل +
-// نتيجتها) حتى لو فشلت وجرّبنا تركيبة تانية — عشان أي مشكلة زي مفتاح متسرّب
-// أو موديل متوقف تبان فورًا في اللوج بدل ما تختفي في console فقط.
-async function callGeminiTurn(env, contents, systemInstruction, functionDeclarations, attemptsLog) {
-  const combos = buildGeminiCombos(env);
-  if (!combos.length) throw new Error("مفيش GEMINI_API_KEY متظبط");
+// نداء Gemini واحد بموديل/مفتاح ثابتين (combo محدد سلفًا) — بدون أي تبديل
+// داخلي. التبديل بين الموديلات بقى مسؤولية الحلقة الكاملة (runAgentLoop)،
+// مش هنا، عشان منمنعش خلط موديلين مختلفين جوه نفس المحادثة (اكتشفنا إن ده
+// بيكسر بعض الموديلات لما بترفض شكل الأدوار اللي موديل تاني بناها).
+async function callGeminiTurnFixed(env, contents, systemInstruction, functionDeclarations, combo, attemptsLog) {
+  const { key, model } = combo;
+  const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      contents,
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      tools: [{ functionDeclarations }],
+      generationConfig: { temperature: 0.3 },
+    }),
+  });
 
-  let lastErr = null;
-  for (const { key, model } of combos) {
-    try {
-      const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-        body: JSON.stringify({
-          contents,
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          tools: [{ functionDeclarations }],
-          generationConfig: { temperature: 0.3 },
-        }),
-      });
-
-      if (res.status === 429 || res.status === 503) {
-        lastErr = new Error(`Gemini ${res.status} على ${model}`);
-        if (attemptsLog) attemptsLog.push({ model, status: res.status, ok: false, note: "rate-limited/unavailable، جُرّبت تركيبة تانية" });
-        continue;
-      }
-      if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`Gemini HTTP ${res.status}: ${errText.slice(0, 300)}`);
-      }
-
-      if (attemptsLog) attemptsLog.push({ model, status: res.status, ok: true });
-      const data = await res.json();
-      const candidate = data.candidates && data.candidates[0];
-      return (candidate && candidate.content && candidate.content.parts) || [];
-    } catch (err) {
-      lastErr = err;
-      if (attemptsLog) attemptsLog.push({ model, status: null, ok: false, note: err.message.slice(0, 200) });
-      console.error("Gemini turn failed", model, err.message);
-    }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const msg = `Gemini HTTP ${res.status} (${model}): ${errText.slice(0, 300)}`;
+    if (attemptsLog) attemptsLog.push({ model, status: res.status, ok: false, note: msg });
+    throw new Error(msg);
   }
-  throw lastErr || new Error("كل تركيبات Gemini فشلت من غير سبب واضح");
+
+  if (attemptsLog) attemptsLog.push({ model, status: res.status, ok: true });
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  return (candidate && candidate.content && candidate.content.parts) || [];
 }
 
 // -----------------------------------------------------------------------------
@@ -360,6 +345,7 @@ const AGENT_SYSTEM_INSTRUCTION = [
   "3. لو محتاج فعل فعلي، استخدم list_tools الأول. لو الأداة المناسبة مش ظاهرة فيها، نادِ call_tool بالاسم search_tools لتكتشفها (زي ما اتشرح فوق)، بعدين call_tool تاني بالاسم الحقيقي اللي لقيته لتنفيذها.",
   "3ب. اربط نوع الأداة بشكل الحدث: لو الحدث الخام فيه conversationId (يعني رسالة/DM)، ممنوع تستخدم أي أداة اسمها فيها comments — دور بـ search_tools عن أداة اسمها فيها messages. لو الحدث فيه postId أو platformPostId من غير conversationId (يعني تعليق)، أدوات comments_* هي الصح.",
   "3ج. لو نفس الأداة فشلت مرتين بأخطاء زي 'not found' أو 'invalid' أو 'platform_api_error'، الأغلب إنك مستخدم الأداة الغلط أصلاً، مش إن الـ IDs غلط. ارجع لـ search_tools بدل ما تكرر نفس الأداة بـ IDs مختلفة.",
+  "3د. لو الحدث فيه conversationId (رسالة/DM)، لازم قبل أي رد تجيب آخر 20 رسالة في نفس المحادثة (أداة زي messages_get_inbox_conversation_messages، دورها بـ search_tools لو مش ظاهرة) عشان تفهم السياق الكامل — حتى لو الرسالة الحالية شكلها واضحة لوحدها.",
   "4. استخدم الـ IDs الحقيقية الموجودة في نص الحدث بالظبط (مثل comment id، conversation id، account id) — لا تخترع أي قيمة غير موجودة في النص.",
   "5. لو نداء أداة رجع خطأ، اقرا رسالة الخطأ بعناية وصحّح الـ arguments أو جرّب أداة بديلة قبل ما تستسلم.",
   "6. لو بتصيغ ردًا فعليًا لعميل، اكتبه بنفس لغته (عربي فصحى أو عامية أو إنجليزي) وخليه ودود ومختصر ومحترف.",
@@ -390,6 +376,21 @@ async function executeAgentFunction(env, sessionId, name, args) {
       }
     }
 
+    // كاش لنداءات search_tools تحديدًا (بحث = قراءة، آمن نكاشه) — بيوفر
+    // ثانيتين-تلاتة على كل حدث بعد أول مرة، مهم لأن الميزانية الكلية للحدث
+    // محدودة بحوالي 30 ثانية (حد ctx.waitUntil في Cloudflare Workers).
+    // مبنكاشش أي أداة تانية (خصوصًا أفعال الإرسال) — دي قراءة بحتة بس.
+    if (toolName === "search_tools" && toolArgs && typeof toolArgs.query === "string") {
+      const cacheKey = `search:${toolArgs.query.toLowerCase().trim()}`;
+      const cached = await kvGetJSON(env, cacheKey);
+      if (cached) return cached.text;
+
+      const result = await mcpCallTool(env, sessionId, toolName, toolArgs);
+      const text = result.text || (result.ok ? "(نجح، بدون رد نصي)" : "فشل تنفيذ الأداة بدون تفاصيل إضافية.");
+      if (result.ok) await kvSetJSON(env, cacheKey, { text }, TOOLS_CACHE_TTL_SECONDS);
+      return text;
+    }
+
     const result = await mcpCallTool(env, sessionId, toolName, toolArgs);
     return result.text || (result.ok ? "(نجح التنفيذ، بدون رد نصي من الأداة)" : "فشل تنفيذ الأداة بدون تفاصيل إضافية.");
   }
@@ -397,21 +398,27 @@ async function executeAgentFunction(env, sessionId, name, args) {
   return `دالة غير معروفة: ${name}`;
 }
 
-// الحلقة الكاملة: بتدي الحدث الخام كنص، وبترجع أثر كامل للخطوات (للتسجيل
-// والتشخيص) + الرد النهائي + سبب التوقف + كل محاولات Gemini (نجحت أو فشلت).
-async function runAgentLoop(env, sessionId, rawEventText) {
+// دورة كاملة بموديل واحد ثابت — بترجع نتيجة دايمًا (مفيهاش throw خالص، حتى
+// لو فشلت)، عشان الخطوات اللي حصلت قبل أي فشل متتسجلش أبدًا وتضيع.
+async function runAgentLoopWithModel(env, sessionId, rawEventText, combo) {
   const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
   const steps = [];
   const geminiAttempts = [];
 
   for (let i = 0; i < MAX_AGENT_STEPS; i++) {
-    const parts = await callGeminiTurn(env, contents, AGENT_SYSTEM_INSTRUCTION, AGENT_FUNCTIONS, geminiAttempts);
+    let parts;
+    try {
+      parts = await callGeminiTurnFixed(env, contents, AGENT_SYSTEM_INSTRUCTION, AGENT_FUNCTIONS, combo, geminiAttempts);
+    } catch (err) {
+      return { ok: false, steps, finalText: null, stopReason: "error", error: err.message, geminiAttempts };
+    }
+
     const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
     const thought = parts.filter((p) => p.text).map((p) => p.text).join("\n").trim();
 
     if (!functionCalls.length) {
       steps.push({ step: i + 1, ts: isoNow(), type: "final", text: thought });
-      return { steps, finalText: thought, stopReason: "final", geminiAttempts };
+      return { ok: true, steps, finalText: thought, stopReason: "final", geminiAttempts };
     }
 
     contents.push({ role: "model", parts });
@@ -438,7 +445,28 @@ async function runAgentLoop(env, sessionId, rawEventText) {
     contents.push({ role: "function", parts: responseParts });
   }
 
-  return { steps, finalText: null, stopReason: "max-steps", geminiAttempts };
+  return { ok: true, steps, finalText: null, stopReason: "max-steps", geminiAttempts };
+}
+
+// الغلاف الخارجي: بيجرب موديل واحد ثابت للحدث كله. لو فشل *قبل أي خطوة
+// حقيقية* (steps فاضية، يعني مفيش فعل حصل)، آمن نجرب موديل تاني من الصفر.
+// لو فشل *بعد* ما فعل حقيقي حصل، بنوقف فورًا ونسجل بدل ما نعيد المحاولة —
+// عشان منعملش فعل مكرر (زي إرسال رسالة مرتين) بموديل مختلف مش عارف إن
+// الأول خلص جزء من الشغل خلاص.
+async function runAgentLoop(env, sessionId, rawEventText) {
+  const combos = buildGeminiCombos(env);
+  if (!combos.length) {
+    return { steps: [], finalText: null, stopReason: "error", error: "مفيش GEMINI_API_KEY متظبط", geminiAttempts: [] };
+  }
+
+  let lastResult = null;
+  for (const combo of combos) {
+    const result = await runAgentLoopWithModel(env, sessionId, rawEventText, combo);
+    if (result.ok) return result;
+    lastResult = result;
+    if (result.steps.length > 0) return result; // فعل حقيقي حصل بالفعل — منكررش بموديل تاني
+  }
+  return lastResult || { steps: [], finalText: null, stopReason: "error", error: "كل الموديلات فشلت", geminiAttempts: [] };
 }
 
 // -----------------------------------------------------------------------------
@@ -483,31 +511,49 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
     return;
   }
 
+  let trace;
+  let initError = null;
   try {
     const sessionId = await mcpInitialize(env);
-    const trace = await runAgentLoop(env, sessionId, rawBody);
-    const finishedAt = isoNow();
-    await logActivity(env, {
-      eventId,
-      event: eventType,
-      trigger,
-      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+    trace = await runAgentLoop(env, sessionId, rawBody);
+  } catch (err) {
+    // فشل قبل ما الحلقة تبدأ أصلاً (مثلاً initialize نفسها فشلت) — حالة
+    // نادرة، runAgentLoop نفسها بترجع نتيجة دايمًا ومبترميش استثناء.
+    console.error("handleZernioEvent failed before agent loop", eventType, err);
+    initError = err.message;
+  }
+
+  const finishedAt = isoNow();
+  const entry = {
+    eventId,
+    event: eventType,
+    trigger,
+    timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+  };
+
+  if (initError) {
+    Object.assign(entry, { outcome: "error", error: initError });
+  } else {
+    Object.assign(entry, {
       outcome: trace.stopReason,
       finalText: trace.finalText,
+      error: trace.error,
       geminiAttempts: trace.geminiAttempts,
       steps: trace.steps,
     });
-  } catch (err) {
-    console.error("handleZernioEvent failed", eventType, err);
-    const finishedAt = isoNow();
-    await logActivity(env, {
-      eventId,
-      event: eventType,
-      trigger,
-      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
-      outcome: "error",
-      error: err.message,
-    });
+  }
+
+  await logActivity(env, entry);
+
+  // أي حدث ماخلصش برد نهائي واضح (خطأ، أو وصل لحد الخطوات) بيتسجل في طابور
+  // مراجعة منفصل — يظهر لوحده في /health/review لحد ما حد يراجعه ويعلّمه.
+  if (entry.outcome === "error" || entry.outcome === "max-steps") {
+    await kvSetJSON(
+      env,
+      `review:${eventId}`,
+      { eventId, event: eventType, outcome: entry.outcome, error: entry.error, finalText: entry.finalText, ts: finishedAt },
+      LOG_TTL_SECONDS
+    );
   }
 }
 
@@ -598,7 +644,33 @@ async function handleHealth(request, env) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) نقطة الدخول الرئيسية
+// 9) /health/review — طابور الأحداث اللي محتاجة مراجعة بشرية
+// -----------------------------------------------------------------------------
+
+async function handleReviewQueue(request, env) {
+  const url = new URL(request.url);
+  if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
+    return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... في الرابط." }, 401);
+  }
+
+  const resolveId = url.searchParams.get("resolve");
+  if (resolveId) {
+    await env.ZERNIO_KV.delete(`review:${resolveId}`).catch(() => {});
+    return jsonResponse({ ok: true, resolved: resolveId });
+  }
+
+  try {
+    const listRes = await env.ZERNIO_KV.list({ prefix: "review:", limit: 1000 });
+    const items = (await Promise.all(listRes.keys.map((k) => kvGetJSON(env, k.name)))).filter(Boolean);
+    items.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+    return jsonResponse({ ok: true, pendingCount: items.length, items });
+  } catch (err) {
+    return jsonResponse({ ok: false, error: err.message }, 500);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 10) نقطة الدخول الرئيسية
 // -----------------------------------------------------------------------------
 
 export default {
@@ -618,9 +690,14 @@ export default {
         return await handleHealth(request, env);
       }
 
+      if (request.method === "GET" && url.pathname === "/health/review") {
+        return await handleReviewQueue(request, env);
+      }
+
       return textResponse("Not found", 404);
     } catch (err) {
       console.error("Unhandled fetch error", err);
+      await logActivity(env, { event: "webhook", outcome: "fatal-error", error: err.message, timing: { receivedAt: isoNow() } }).catch(() => {});
       return jsonResponse({ ok: false, error: err.message }, 500);
     }
   },
