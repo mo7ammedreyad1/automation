@@ -56,7 +56,7 @@
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 
-const DEFAULT_GEMINI_MODELS = ["gemini-3-flash-preview"];
+const DEFAULT_GEMINI_MODELS = ["gemma-4-31b-it"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60; // 3 أيام (أكبر من أطول إعادة إرسال موثقة عند Zernio ~51 ساعة)
