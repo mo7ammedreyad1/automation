@@ -1,33 +1,33 @@
 // =============================================================================
-// Zernio Social Inbox Agent — Cloudflare Worker (v3: code-execution agent, DM only)
+// Zernio Social Inbox Agent — Cloudflare Worker (v4: structured-call agent, DM only)
 // =============================================================================
 //
 // المعمارية: أي حدث webhook من Zernio بيوصل خام (نص JSON كامل) لموديل Gemini.
-// مفيش MCP خالص في النسخة دي. الموديل بيرد بواحد من شكلين بس:
+// مفيش MCP خالص، ومفيش تنفيذ كود حر (new Function/eval) — اتضح من أول تجربة
+// حقيقية إن Cloudflare Workers بترفض code-generation-from-strings نهائيًا
+// على مستوى المنصة (مفيش compatibility flag بيفعّلها)، فده مسار مقفول تمامًا
+// مش حاجة نقدر نصلحها في الكود.
 //
-//   {"action": "code", "code": "..."}   — كود JS يتنفذ فورًا جوه الـ worker
-//   {"action": "final", "text": "..."}  — انتهى، ده اللي بيوقف المعالجة
+// البديل: الموديل بيرد بواحد من شكلين بس:
 //
-// الكود اللي الموديل بيكتبه بيتنفذ جوه new Function (مش eval) في الـ global
-// scope — يعني مفيش أي متغير من الملف ده (env, rawBody, secrets...) قابل
-// للوصول من جوه الكود ده غير اللي بنمرره احنا صراحة كـ arguments تلاتة بس:
-//   - fetch          : نسخة مقيدة بتقبل بس دومين zernio.com (حماية من إن
-//                       injection من تعليق/DM يخلي الكود يبعت بيانات لسيرفر
-//                       تاني)
-//   - ZERNIO_API_KEY  : قيمة السر الحقيقية — الموديل بيستخدم اسم المتغير ده
-//                       في الكود، من غير ما يكتب القيمة الحرفية أبدًا (متتحطش
-//                       في أي نص بيتبعت للموديل نفسه ولا في اللوج — انظر
-//                       redactSecret)
-//   - ZERNIO_BASE_URL : https://zernio.com/api/v1
+//   {"action": "call", "calls": [{"name": "...", "args": {...}}, ...]}
+//       — عملية واحدة أو أكتر من كتالوج ثابت إحنا كاتبينه (انظر CALL_HANDLERS
+//         تحت)، بتتنفذ بالترتيب. كل عملية = نداء REST حقيقي على Zernio
+//         بيتنفذ بكودنا احنا، مش بكود الموديل — يعني مفيش أي حاجة يقدر
+//         الموديل يوصلها غير الأسماء والـ args اللي هو كاتبهم كـ بيانات JSON
+//         عادية (مش كود قابل للتنفيذ)، وده أأمن حتى من فكرة الكود الحر
+//         الأصلية.
+//   {"action": "final", "text": "..."}
+//       — انتهى، ده اللي بيوقف المعالجة.
 //
-// النسخة دي (v3) شغالة على رسائل الـ DM بس (message.received). أي حدث تاني
+// النسخة دي (v4) شغالة على رسائل الـ DM بس (message.received). أي حدث تاني
 // (comment.received, referral.received, account.disconnected) بيتسجل باللوج
 // من غير ما يتبعت لـ Gemini خالص — هيتفعّل لما نضيف كتالوج أدوات التعليقات.
 //
 // الاستثناء الأمني الوحيد المكتوب في الكود (مش قرار للموديل): تجاهل أي حدث
 // صادر من الحساب نفسه (تعليق فيه isOwnAccount، أو رسالة direction !=
 // incoming) — منعًا لحلقة رد-على-النفس اللانهائية. المنطق ده منقول زي ما هو
-// من النسخة اللي قبل كده (v2)، لأنه اتبنى على شكل payload حقيقي مُختبر.
+// من النسخ اللي قبل كده، لأنه اتبنى على شكل payload حقيقي مُختبر.
 //
 // الأسرار المطلوبة (تتحط يدوي في Cloudflare Dashboard أو wrangler secret put):
 //   ZERNIO_API_KEY         — نفس المفتاح شغال REST (Bearer) على
@@ -39,16 +39,15 @@
 //
 // KV binding المطلوب في wrangler.jsonc: باسم ZERNIO_KV
 //
-// ملاحظة مفتوحة: لسه معندناش عينة payload حقيقية موثّقة لشكل الـ account id
-// جوه حدث message.received (id ولا _id). ده مش مشكلة لمنطق الملف ده نفسه —
-// الموديل بيقرا الـ JSON الخام بنفسه ويستخرج الـ IDs الصح منه مباشرة — لكن
-// يستاهل تتأكد منه من أول تشغيل حقيقي (شوف اللوج).
+// ملاحظة مفتوحة لسه: شكل accountId جوه حدث message.received (id ولا _id)
+// بيتأكد من أول تشغيل حقيقي عن طريق الموديل نفسه (بيقرا الـ JSON الخام
+// ويستخرج القيمة الصح) — تابع اللوج للتأكد.
 //
 // ملاحظة تانية: المرفقات (صور/صوت) الجاية في رسائل الدخول بتوصل للموديل كـ
-// نص (رابط جوه الـ JSON الخام) مش كمحتوى وسائط فعلي — يعني الموديل عارف إن
-// فيه مرفق ومعاه رابطه، لكنه لسه مش "شايف" الصورة ولا "سامع" الصوت فعليًا.
-// لو محتاج فهم فعلي لمحتوى الوسائط، ده خطوة تالية منفصلة (تحويل الـ Gemini
-// call لـ multimodal وتنزيل المرفق وتمريره كـ inline data).
+// نص (رابط جوه الـ JSON الخام) مش كمحتوى وسائط فعلي — الموديل عارف إن فيه
+// مرفق ومعاه رابطه، لكنه لسه مش "شايف" الصورة ولا "سامع" الصوت فعليًا. لو
+// محتاج فهم فعلي لمحتوى الوسائط، ده خطوة تالية منفصلة (تحويل نداء Gemini
+// لـ multimodal وتنزيل المرفق وتمريره كـ inline data).
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -56,7 +55,6 @@
 // -----------------------------------------------------------------------------
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
-const ZERNIO_ALLOWED_HOST = "zernio.com";
 
 const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -69,9 +67,9 @@ const LOG_LIST_LIMIT = 30;
 // اللانهائي، مش قرار على مضمون الرد.
 const MAX_AGENT_STEPS = 10;
 
-// حد أقصى لوقت تنفيذ أي كود يكتبه الموديل — حماية من كود بيعلق (حلقة
-// لانهائية، fetch بيستنى للأبد...) ياكل من ميزانية ctx.waitUntil كلها.
-const CODE_EXEC_TIMEOUT_MS = 20000;
+// حد أقصى لوقت أي نداء REST واحد على Zernio — حماية من نداء بيعلق ياكل من
+// ميزانية ctx.waitUntil كلها.
+const CALL_TIMEOUT_MS = 15000;
 
 // -----------------------------------------------------------------------------
 // 2) أدوات مساعدة عامة (JSON responses, hex, HMAC, KV wrappers)
@@ -175,74 +173,133 @@ async function listRecentLogs(env, { limit = LOG_LIST_LIMIT, eventId = null, sin
   }
 }
 
-// -----------------------------------------------------------------------------
-// 3) بيئة تنفيذ كود الموديل (sandboxed code execution)
-// -----------------------------------------------------------------------------
-//
-// new Function (مش eval) بينفذ الكود في الـ global scope، مش في closure
-// الملف ده — يعني حتى لو الكود المولّد حاول يقرا أي متغير تاني غير التلاتة
-// اللي بنمررهم صراحة، مش هيلاقيه أصلاً (undefined / ReferenceError).
-
-function makeRestrictedFetch(allowedHost) {
-  return async function fetch(url, options) {
-    let parsed;
-    try {
-      parsed = new URL(String(url));
-    } catch (err) {
-      throw new Error(`رابط غير صالح: ${url}`);
-    }
-    if (parsed.hostname !== allowedHost) {
-      throw new Error(`fetch مسموح بس لدومين ${allowedHost} — الرابط اللي اتحاول توصله: ${parsed.hostname}`);
-    }
-    return globalThis.fetch(parsed.toString(), options);
-  };
-}
-
-// دفاع إضافي: لو الكود المولّد رجّع أو رمى نص فيه القيمة الحرفية للسر
-// بالغلط، نمسحها قبل ما تتسجل باللوج أو ترجع لسياق الموديل نفسه.
+// دفاع إضافي: لو أي نص (رسالة خطأ من Zernio مثلاً) فيه ظهور حرفي للسر
+// بالصدفة، نمسحه قبل ما يتسجل باللوج أو يرجع لسياق الموديل. المخاطرة دي
+// أصلاً بقت شبه معدومة في التصميم الجديد (الموديل مش بيشوف السر أبدًا في
+// أي مرحلة)، لكن سايبينها كطبقة حماية إضافية رخيصة.
 function redactSecret(text, secret) {
   if (!secret || typeof text !== "string") return text;
   return text.split(secret).join("[REDACTED]");
 }
 
-async function executeGeneratedCode(env, code) {
-  const restrictedFetch = makeRestrictedFetch(ZERNIO_ALLOWED_HOST);
+// -----------------------------------------------------------------------------
+// 3) كتالوج العمليات المسموحة (call handlers)
+// -----------------------------------------------------------------------------
+//
+// كل دالة هنا بتاخد (env, args) وبترجع { ok, status, data }. الموديل بيختار
+// الاسم والـ args بس (بيانات JSON، مش كود قابل للتنفيذ) — الدالة نفسها
+// مكتوبة إحنا وثابتة، فمفيش أي URL أو domain الموديل يقدر يتحكم فيه.
 
-  let fn;
+async function zernioFetch(env, path, options = {}) {
+  const url = `${ZERNIO_API_BASE}${path}`;
+  const headers = Object.assign(
+    { Authorization: `Bearer ${env.ZERNIO_API_KEY}` },
+    options.body ? { "Content-Type": "application/json" } : {},
+    options.headers || {}
+  );
+  const res = await Promise.race([
+    fetch(url, { ...options, headers }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`انتهت مهلة نداء REST (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
+    ),
+  ]);
+  const bodyText = await res.text();
+  let data;
   try {
-    fn = new Function(
-      "fetch",
-      "ZERNIO_API_KEY",
-      "ZERNIO_BASE_URL",
-      `"use strict";\nreturn (async () => {\n${code}\n})();`
-    );
-  } catch (err) {
-    return { ok: false, text: `خطأ في صياغة الكود (syntax error): ${err.message}` };
+    data = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_) {
+    data = { raw: bodyText.slice(0, 500) };
   }
+  return { ok: res.ok, status: res.status, data };
+}
 
-  try {
-    const raw = await Promise.race([
-      fn(restrictedFetch, env.ZERNIO_API_KEY, ZERNIO_API_BASE),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`انتهت مهلة تنفيذ الكود (${CODE_EXEC_TIMEOUT_MS / 1000} ثانية)`)), CODE_EXEC_TIMEOUT_MS)
-      ),
-    ]);
-    let text;
-    if (typeof raw === "string") text = raw;
-    else {
-      try {
-        text = JSON.stringify(raw, null, 2);
-      } catch (_) {
-        text = String(raw);
-      }
-      if (text === undefined) text = "(الكود اتنفذ من غير return، مفيش نتيجة)";
+function missingArgsError(names) {
+  return { ok: false, status: 0, data: { error: `محتاج الحقول دي: ${names.join(", ")}` } };
+}
+
+const CALL_HANDLERS = {
+  // جلب آخر رسائل محادثة — استخدمها لوحدها (من غير أي عملية تانية معاها في
+  // نفس الـ batch) قبل أي رد فعلي، عشان تقرا نتيجتها وتفهم السياق الأول.
+  async listMessages(env, args) {
+    const { conversationId, accountId, limit = 20, sortOrder = "desc", cursor } = args || {};
+    if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
+    const qs = new URLSearchParams({ accountId, limit: String(limit), sortOrder });
+    if (cursor) qs.set("cursor", cursor);
+    return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages?${qs}`, { method: "GET" });
+  },
+
+  // إرسال رسالة نصية و/أو مرفق (صورة/فيديو/صوت/ملف).
+  async sendMessage(env, args) {
+    const { conversationId, accountId, message, attachmentUrl, attachmentType } = args || {};
+    if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
+    if (!message && !attachmentUrl) return missingArgsError(["message أو attachmentUrl (واحد منهم على الأقل)"]);
+    const body = { accountId };
+    if (message) body.message = message;
+    if (attachmentUrl) {
+      body.attachmentUrl = attachmentUrl;
+      body.attachmentType = attachmentType || "file";
     }
-    text = redactSecret(text, env.ZERNIO_API_KEY);
-    return { ok: true, text: text.slice(0, 4000) };
-  } catch (err) {
-    const msg = redactSecret(String((err && err.message) || err), env.ZERNIO_API_KEY);
-    return { ok: false, text: `خطأ أثناء تنفيذ الكود: ${msg}` };
+    return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  // مؤشر "بيكتب..." — اختياري، لمسة واقعية بس.
+  async typingIndicator(env, args) {
+    const { conversationId, accountId } = args || {};
+    if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
+    return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/typing`, {
+      method: "POST",
+      body: JSON.stringify({ accountId }),
+    });
+  },
+
+  // إضافة reaction (إيموجي) على رسالة معينة — اختياري.
+  async addReaction(env, args) {
+    const { conversationId, accountId, messageId, emoji } = args || {};
+    if (!conversationId || !accountId || !messageId || !emoji) {
+      return missingArgsError(["conversationId", "accountId", "messageId", "emoji"]);
+    }
+    return zernioFetch(
+      env,
+      `/inbox/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/reactions`,
+      { method: "POST", body: JSON.stringify({ accountId, emoji }) }
+    );
+  },
+
+  // إزالة reaction — اختياري.
+  async removeReaction(env, args) {
+    const { conversationId, accountId, messageId } = args || {};
+    if (!conversationId || !accountId || !messageId) {
+      return missingArgsError(["conversationId", "accountId", "messageId"]);
+    }
+    const qs = new URLSearchParams({ accountId });
+    return zernioFetch(
+      env,
+      `/inbox/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/reactions?${qs}`,
+      { method: "DELETE" }
+    );
+  },
+};
+
+async function executeCalls(env, calls) {
+  const results = [];
+  for (const c of calls) {
+    const name = c && c.name;
+    const handler = CALL_HANDLERS[name];
+    if (!handler) {
+      results.push({ name, ok: false, data: { error: `اسم عملية غير معروف: "${name}". العمليات المتاحة: ${Object.keys(CALL_HANDLERS).join(", ")}` } });
+      continue;
+    }
+    try {
+      const r = await handler(env, c.args || {});
+      results.push({ name, ok: r.ok, status: r.status, data: r.data });
+    } catch (err) {
+      results.push({ name, ok: false, data: { error: redactSecret(String((err && err.message) || err), env.ZERNIO_API_KEY) } });
+    }
   }
+  return results;
 }
 
 // -----------------------------------------------------------------------------
@@ -294,77 +351,44 @@ async function callGeminiTurnFixed(env, contents, systemInstruction, combo, atte
 //
 // الموديل بيرد بنص عادي (role: user/model بس)، والنص ده لازم يكون كائن JSON
 // واحد بواحد من شكلين ثابتين، وإحنا اللي بنحلله:
-//   {"action": "code", "code": "..."}   — كود JS يتنفذ فورًا
-//   {"action": "final", "text": "..."}  — رد نهائي، بيوقف المعالجة
+//   {"action": "call", "calls": [{"name": "...", "args": {...}}, ...]}
+//   {"action": "final", "text": "..."}
 
 const AGENT_SYSTEM_INSTRUCTION = [
   "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages (فيسبوك وانستجرام) اللي بتوصلك خام كأحداث webhook من منصة Zernio. النسخة دي شغالة على الـ DMs بس دلوقتي — لو استقبلت أي حاجة تانية غير رسالة DM، اعتبرها غلط ورد بـ final فيه نص قصير يوضح كده من غير أي فعل.",
   "",
   "طريقة الرد (مهم جدًا تلتزم بيها بالحرف): كل رد منك لازم يكون كائن JSON واحد بس، من غير أي نص تاني قبله أو بعده أو أي markdown، بواحد من الشكلين دول بالظبط:",
-  '1) {"action": "code", "code": "..."} — كود JavaScript (async) بينفذ فورًا جوه الـ Cloudflare Worker.',
+  '1) {"action": "call", "calls": [{"name": "اسم العملية", "args": {...}}, ...]} — عملية واحدة أو أكتر من الكتالوج تحت، بتتنفذ بالترتيب وترجعلك نتيجة كل واحدة.',
   '2) {"action": "final", "text": "..."} — لما تنتهي من كل الأفعال المطلوبة، أو تقرر عدم الحاجة لأي فعل من الأساس.',
   "",
-  "بيئة تنفيذ الكود (مهم تفهمها كويس):",
-  "- الكود اللي تكتبه بيتنفذ كـ جسم دالة async — يعني تقدر تستخدم await عادي وتكتب return في الآخر يرجّع نتيجة (نص أو كائن) هتشوفها في الخطوة اللي بعدها.",
-  "- عندك 3 متغيرات جاهزة بس، تقدر تستخدمهم بالاسم من غير ما تعرّفهم: fetch, ZERNIO_API_KEY, ZERNIO_BASE_URL.",
-  "- ZERNIO_BASE_URL = \"https://zernio.com/api/v1\".",
-  "- تحذير أمني حاسم: متكتبش قيمة ZERNIO_API_KEY الحرفية في الكود أبدًا تحت أي ظرف — استخدم اسم المتغير ZERNIO_API_KEY بس، وإحنا بنحقن القيمة الحقيقية وقت التنفيذ. لو رجّعت أو طبعت القيمة دي بأي شكل هتتشال من النتيجة تلقائيًا.",
-  "- الـ fetch المتاحة ليك مقيدة تبعت بس لدومين zernio.com — أي محاولة توصل دومين تاني هترجع خطأ فورًا.",
-  "- لو الكود رمى استثناء (throw / fetch فشل / JSON غير صالح...) هيترجم لنص خطأ بيوصلك في الخطوة اللي بعدها، اقراه واصلحه.",
+  "قاعدة مهمة عن تجميع أكتر من عملية في نفس الخطوة (calls array): اجمع عمليات مستقلة عن بعض بس (زي: ترسل رسالة + تبعت مؤشر كتابة، أو ترسل رسالة + تضيف reaction عليها). أما listMessages فلازم تكون لوحدها في خطوة منفصلة قبل أي رد — تجميعها مع sendMessage في نفس الخطوة معناه هتكتب نص الرد من غير ما تكون قريت نتيجتها فعلاً، وده يبطل الغرض منها.",
   "",
-  "كتالوج الـ REST endpoints المتاحة ليك (كلها REST حقيقي على Zernio، الـ Authorization header دايمًا `Bearer ${ZERNIO_API_KEY}`):",
+  "الكتالوج (كل عملية دي نداء REST حقيقي على Zernio بينفذه كودنا احنا، إنت بس بتحدد الاسم والـ args):",
   "",
-  "1) جلب آخر رسائل محادثة (سياق) — استخدمها إلزاميًا قبل أي رد فعلي على DM، حتى لو الرسالة الحالية واضحة لوحدها:",
-  "GET /inbox/conversations/{conversationId}/messages?accountId={accountId}&limit=20&sortOrder=desc",
-  "مثال:",
-  '```js',
-  'const res = await fetch(`${ZERNIO_BASE_URL}/inbox/conversations/${conversationId}/messages?accountId=${accountId}&limit=20&sortOrder=desc`, {',
-  '  headers: { Authorization: `Bearer ${ZERNIO_API_KEY}` },',
-  '});',
-  'const data = await res.json();',
-  'return JSON.stringify(data.messages);',
+  '- listMessages — args: { conversationId, accountId, limit? (افتراضي 20), sortOrder? ("asc"|"desc"، افتراضي "desc" يعني الأحدث الأول), cursor? }',
+  "  استخدمها إلزاميًا (لوحدها) قبل أي رد فعلي على DM، حتى لو الرسالة الحالية واضحة لوحدها، عشان تفهم سياق المحادثة كامل.",
+  "  كل مرفق (attachments[]) في النتيجة على انستجرام/فيسبوك ليه url بينتهي صلاحيته و refreshUrl ثابت — لو محتاج مرفق من رسالة قديمة استخدم refreshUrl.",
+  "",
+  '- sendMessage — args: { conversationId, accountId, message? (نص), attachmentUrl? (رابط عام), attachmentType? ("image"|"video"|"audio"|"file") }',
+  "  لازم message أو attachmentUrl على الأقل. للرد بصورة أو صوت، حط attachmentUrl + attachmentType المناسب مع نص اختياري في message لو حابب.",
+  "",
+  '- typingIndicator — args: { conversationId, accountId } (اختياري، لمسة واقعية بس مش إلزامية)',
+  "",
+  '- addReaction — args: { conversationId, accountId, messageId, emoji } (اختياري)',
+  '- removeReaction — args: { conversationId, accountId, messageId } (اختياري)',
+  "",
+  "مثال كامل لخطوة call بعملية واحدة:",
+  '```json',
+  '{"action": "call", "calls": [{"name": "sendMessage", "args": {"conversationId": "6a92...", "accountId": "6a92...", "message": "أهلاً بك"}}]}',
   '```',
-  "ملاحظة: كل مرفق (attachments[]) على انستجرام/فيسبوك ليه url بينتهي صلاحيته و refreshUrl ثابت — لو محتاج تستخدم مرفق قديم مش الرسالة الحالية، استخدم الـ refreshUrl مش الـ url.",
-  "",
-  "2) إرسال رسالة نصية:",
-  "POST /inbox/conversations/{conversationId}/messages",
-  '```js',
-  'const res = await fetch(`${ZERNIO_BASE_URL}/inbox/conversations/${conversationId}/messages`, {',
-  '  method: "POST",',
-  '  headers: { Authorization: `Bearer ${ZERNIO_API_KEY}`, "Content-Type": "application/json" },',
-  '  body: JSON.stringify({ accountId, message: "نص الرد هنا" }),',
-  '});',
-  'const data = await res.json();',
-  'return JSON.stringify(data);',
-  '```',
-  "",
-  "3) إرسال صورة أو فيديو أو صوت (attachmentType: image | video | audio | file)، مع نص اختياري:",
-  '```js',
-  'const res = await fetch(`${ZERNIO_BASE_URL}/inbox/conversations/${conversationId}/messages`, {',
-  '  method: "POST",',
-  '  headers: { Authorization: `Bearer ${ZERNIO_API_KEY}`, "Content-Type": "application/json" },',
-  '  body: JSON.stringify({ accountId, message: "نص اختياري", attachmentUrl: "https://...", attachmentType: "image" }),',
-  '});',
-  'const data = await res.json();',
-  'return JSON.stringify(data);',
-  '```',
-  "لازم attachmentUrl يكون رابط عام (publicly accessible). لو الملف اللي عايز تبعته مش على رابط عام أصلاً، ارفعه الأول:",
-  "POST /media/upload-direct (multipart/form-data، فيه file) — بيرجّع { url } تستخدمه كـ attachmentUrl.",
-  "",
-  "4) مؤشر إنه بيكتب رد (اختياري، لمسة واقعية بس مش إلزامية):",
-  "POST /inbox/conversations/{conversationId}/typing — body: { accountId }",
-  "",
-  "5) إضافة/إزالة reaction على رسالة (اختياري):",
-  "POST /inbox/conversations/{conversationId}/messages/{messageId}/reactions — body: { accountId, emoji }",
-  "DELETE بنفس الرابط + ?accountId=... لإزالتها.",
   "",
   "طريقة عملك:",
   "1. اقرا حدث الـ DM الخام اللي وصلك بعناية، واستخرج منه conversationId و accountId الحقيقيين بالظبط زي ما ظهروا في النص — ما تخترعش أي قيمة غير موجودة.",
-  "2. نفّذ كود يجيب آخر الرسائل (أداة 1) الأول عشان تفهم سياق المحادثة كامل.",
-  "3. لو محتاج ترد فعليًا، اكتب كود ينفذ الإرسال المناسب (نص/صورة/فيديو/صوت) بأداة 2 أو 3.",
-  "4. لو نداء REST رجع خطأ (status مش 2xx)، اقرا رسالة الخطأ (error/code/platformError في رد الـ JSON) وصحح الكود (اسم الحقل، القيمة، الرابط) قبل ما تعيد المحاولة — بلاش تكرر نفس الكود بالظبط.",
+  "2. نفّذ خطوة فيها listMessages لوحدها الأول عشان تفهم سياق المحادثة كامل.",
+  "3. في الخطوة اللي بعدها، لو محتاج ترد فعليًا، نفّذ sendMessage (ممكن تجمعها مع typingIndicator أو addReaction لو حابب).",
+  "4. لو أي عملية رجعت ok:false، اقرا data.error/data.status وصحح الـ args (اسم الحقل، القيمة) قبل ما تعيد المحاولة — بلاش تكرر نفس الـ args بالظبط.",
   "5. اكتب رد العميل بنفس لغته (عربي فصحى أو عامية أو إنجليزي)، ودود ومختصر ومحترف.",
-  "6. تحذير حاسم: صياغة نص الرد لوحدها متكفيش. لو قررت إن فيه رد لازم يوصل للعميل، لازم تكون نفّذت كود الإرسال فعليًا (أداة 2 أو 3) قبل ما تختم بـ final — رد نهائي فيه محتوى موجّه للعميل من غير تنفيذ إرسال فعلي = العميل مايستقبلش أي حاجة خالص.",
+  "6. تحذير حاسم: صياغة نص الرد لوحدها متكفيش. لو قررت إن فيه رد لازم يوصل للعميل، لازم تكون نفّذت sendMessage فعليًا (ورجع ok:true) قبل ما تختم بـ final — رد نهائي فيه محتوى موجّه للعميل من غير sendMessage فعلي = العميل مايستقبلش أي حاجة خالص.",
   "7. لما تنتهي فعلاً (نفذت كل الأفعال المطلوبة بنجاح، أو قررت من البداية عدم الحاجة لأي رد)، ردّ بـ final — هذا هو اللي بيوقف المعالجة.",
 ].join("\n");
 
@@ -425,7 +449,7 @@ async function runAgentLoopWithModel(env, rawEventText, combo) {
       contents.push({ role: "model", parts: [{ text: String(rawText).slice(0, 2000) }] });
       contents.push({
         role: "user",
-        parts: [{ text: "ردك مش كائن JSON صالح بالشكل المطلوب. رجّع بس واحد من الشكلين المتفق عليهم: code أو final، من غير أي نص إضافي." }],
+        parts: [{ text: "ردك مش كائن JSON صالح بالشكل المطلوب. رجّع بس واحد من الشكلين المتفق عليهم: call أو final، من غير أي نص إضافي." }],
       });
       continue;
     }
@@ -436,26 +460,34 @@ async function runAgentLoopWithModel(env, rawEventText, combo) {
       return { ok: true, steps, finalText, stopReason: "final", geminiAttempts };
     }
 
-    if (action.action === "code") {
-      const code = typeof action.code === "string" ? action.code : "";
-      if (!code.trim()) {
-        steps.push({ step: i + 1, ts: isoNow(), type: "empty-code" });
+    if (action.action === "call") {
+      let calls = action.calls;
+      if (calls && !Array.isArray(calls)) calls = [calls];
+      if (!Array.isArray(calls) || calls.length === 0) {
+        steps.push({ step: i + 1, ts: isoNow(), type: "empty-call" });
         contents.push({ role: "model", parts: [{ text: rawText }] });
-        contents.push({ role: "user", parts: [{ text: "حقل code فاضي. لازم تحط كود JS فعلي فيه." }] });
+        contents.push({
+          role: "user",
+          parts: [{ text: "حقل calls فاضي أو مش array. لازم يكون فيه عملية واحدة على الأقل، كل واحدة فيها name و args." }],
+        });
         continue;
       }
 
-      const result = await executeGeneratedCode(env, code);
+      const results = await executeCalls(env, calls);
       steps.push({
         step: i + 1,
         ts: isoNow(),
-        type: "code",
-        code: code.slice(0, 800),
-        result: String(result.text).slice(0, 500),
-        ok: result.ok,
+        type: "call",
+        calls: calls.slice(0, 10).map((c) => ({ name: c && c.name, args: c && c.args })),
+        results: results.map((r) => ({
+          name: r.name,
+          ok: r.ok,
+          status: r.status,
+          data: JSON.stringify(r.data).slice(0, 400),
+        })),
       });
       contents.push({ role: "model", parts: [{ text: rawText }] });
-      contents.push({ role: "user", parts: [{ text: `نتيجة تنفيذ الكود:\n${result.text}` }] });
+      contents.push({ role: "user", parts: [{ text: `نتيجة تنفيذ العمليات:\n${JSON.stringify(results, null, 2).slice(0, 4000)}` }] });
       continue;
     }
 
@@ -464,7 +496,7 @@ async function runAgentLoopWithModel(env, rawEventText, combo) {
     contents.push({ role: "model", parts: [{ text: rawText }] });
     contents.push({
       role: "user",
-      parts: [{ text: `"action": "${action.action}" مش معروف. استخدم بس: code أو final.` }],
+      parts: [{ text: `"action": "${action.action}" مش معروف. استخدم بس: call أو final.` }],
     });
   }
 
@@ -472,7 +504,7 @@ async function runAgentLoopWithModel(env, rawEventText, combo) {
 }
 
 // الغلاف الخارجي: بيجرب موديل واحد ثابت للحدث كله. لو فشل *قبل أي فعل حقيقي*
-// (مفيش خطوة type:"code" في الأثر لسه)، آمن نجرب موديل تاني من الصفر. لو
+// (مفيش خطوة type:"call" في الأثر لسه)، آمن نجرب موديل تاني من الصفر. لو
 // فشل *بعد* ما فعل حقيقي حصل، بنوقف فورًا ونسجل بدل ما نعيد المحاولة —
 // عشان منعملش فعل مكرر (زي إرسال رسالة مرتين) بموديل مختلف مش عارف إن
 // الأول خلص جزء من الشغل خلاص.
@@ -487,7 +519,7 @@ async function runAgentLoop(env, rawEventText) {
     const result = await runAgentLoopWithModel(env, rawEventText, combo);
     if (result.ok) return result;
     lastResult = result;
-    const hadRealAction = result.steps.some((s) => s.type === "code");
+    const hadRealAction = result.steps.some((s) => s.type === "call");
     if (hadRealAction) return result; // فعل حقيقي حصل بالفعل — منكررش بموديل تاني
   }
   return lastResult || { steps: [], finalText: null, stopReason: "error", error: "كل الموديلات فشلت", geminiAttempts: [] };
