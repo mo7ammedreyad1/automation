@@ -3,7 +3,9 @@
   "name": "zernio-social-inbox-agent",
   "main": "worker.js",
   "compatibility_date": "2025-06-01",
-
+"ai": {
+  "binding": "AI"
+}
   // KV namespace لتخزين: dedup الأحداث، كاش الأدوات المكتشفة، وسجل المتابعة.
   // أنشئه أولًا بالأمر:
   //   npx wrangler kv namespace create ZERNIO_KV
@@ -14,7 +16,6 @@
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
   ]
-"ai": { "binding": "AI" }
   // الأسرار (لا تُكتب هنا خالص) تتحط بالأمر:
   //   npx wrangler secret put ZERNIO_API_KEY
   //   npx wrangler secret put ZERNIO_WEBHOOK_SECRET
