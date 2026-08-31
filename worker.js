@@ -59,7 +59,7 @@ const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 
 // الترتيب = ترتيب المحاولة الفعلي (Workers AI الأول، Gemini أخيرًا).
 const WORKERS_AI_MODELS = [
-  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+  "@@cf/google/gemma-7b-it-lora",
   "@cf/meta/llama-3.2-11b-vision-instruct",
 ];
 
