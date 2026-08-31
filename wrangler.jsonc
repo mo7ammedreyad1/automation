@@ -14,7 +14,7 @@
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
   ]
-
+"ai": { "binding": "AI" }
   // الأسرار (لا تُكتب هنا خالص) تتحط بالأمر:
   //   npx wrangler secret put ZERNIO_API_KEY
   //   npx wrangler secret put ZERNIO_WEBHOOK_SECRET
