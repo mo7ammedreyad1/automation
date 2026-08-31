@@ -56,7 +56,7 @@ const WORKERS_AI_MODELS = [
   "@cf/google/gemma-3-12b-it",
 ];
 
-const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite"];
+const DEFAULT_GEMINI_MODELS = ["gemini"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
@@ -212,7 +212,7 @@ function missingArgsError(names) {
 }
 
 const TOOL_DESCRIPTIONS = {
-  listMessages: "جلب آخر رسائل محادثة DM (سياق)",
+  listMessages: "",
   sendMessage: "إرسال رسالة DM (نص/صورة/فيديو/صوت)",
   typingIndicator: "مؤشر الكتابة — تلقائي، مش من قرار الموديل",
   addReaction: "إضافة reaction على رسالة DM",
