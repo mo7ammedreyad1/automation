@@ -56,7 +56,7 @@ const WORKERS_AI_MODELS = [
   "@cf/google/gemma-3-12b-it",
 ];
 
-const DEFAULT_GEMINI_MODELS = ["gemini"];
+const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
@@ -212,7 +212,7 @@ function missingArgsError(names) {
 }
 
 const TOOL_DESCRIPTIONS = {
-  listMessages: "",
+  listMessages: "جلب آخر رسائل محادثة DM (سياق)",
   sendMessage: "إرسال رسالة DM (نص/صورة/فيديو/صوت)",
   typingIndicator: "مؤشر الكتابة — تلقائي، مش من قرار الموديل",
   addReaction: "إضافة reaction على رسالة DM",
@@ -703,79 +703,104 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
   const startedAt = isoNow();
   const trigger = buildTriggerPreview(payload, rawBody);
 
-  if (isSelfEcho(payload)) {
+  // شبكة أمان شاملة: أي استثناء غير متوقع في أي نقطة تحت (خصوصًا الجلب
+  // التلقائي للسياق، اللي كان مكشوف من غير حماية) لازم ينتج عنه سطر لوج
+  // واحد على الأقل — الحدث ميختفيش بصمت تاني خالص.
+  try {
+    if (isSelfEcho(payload)) {
+      const finishedAt = isoNow();
+      await logActivity(env, {
+        eventId,
+        event: eventType,
+        trigger,
+        timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+        outcome: "skipped-self-echo",
+      });
+      return;
+    }
+
+    if (eventType !== "message.received" && eventType !== "comment.received") {
+      const finishedAt = isoNow();
+      await logActivity(env, {
+        eventId,
+        event: eventType,
+        trigger,
+        timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+        outcome: "skipped-unsupported-event",
+      });
+      return;
+    }
+
+    // جلب سياق تلقائي (بكود ثابت) + مؤشر كتابة للـ DM. contextFetched بيتسجل
+    // في اللوج بالكامل عشان تشخيص أي مشكلة في وصول السياق للموديل.
+    let rawEventText = rawBody;
+    let contextFetched = null;
+
+    if (eventType === "message.received") {
+      const ids = extractMessageContext(payload);
+      if (ids) {
+        CALL_HANDLERS.typingIndicator(env, ids).catch(() => {}); // fire-and-forget
+        const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" });
+        contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
+        rawEventText += `\n\nسياق آخر الرسائل (اتجابت تلقائيًا، مفيش داعي تطلبها تاني إلا لو محتاج أكتر من ${AUTO_CONTEXT_LIMIT} أو صفحة تانية):\n${JSON.stringify(history.data).slice(0, 3000)}`;
+      } else {
+        contextFetched = { type: "messages", error: "extractMessageContext فشل يلاقي conversationId/accountId — السياق ماتجابش خالص" };
+      }
+    } else if (eventType === "comment.received") {
+      const ids = extractCommentContext(payload);
+      if (ids) {
+        const history = await CALL_HANDLERS.listComments(env, { ...ids, limit: AUTO_CONTEXT_LIMIT });
+        contextFetched = { type: "comments", ids, ok: history.ok, status: history.status, data: history.data };
+        rawEventText += `\n\nسياق تعليقات البوست ده (اتجابت تلقائيًا، مفيش داعي تطلبها تاني إلا لو محتاج أكتر):\n${JSON.stringify(history.data).slice(0, 3000)}`;
+      } else {
+        contextFetched = { type: "comments", error: "extractCommentContext فشل يلاقي postId/accountId — السياق ماتجابش خالص" };
+      }
+    }
+
+    const trace = await runAgentLoop(env, rawEventText, eventId);
+
     const finishedAt = isoNow();
+    const entry = {
+      eventId,
+      event: eventType,
+      trigger,
+      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+      contextFetched,
+      outcome: trace.stopReason,
+      finalText: trace.finalText,
+      error: trace.error,
+      geminiAttempts: trace.geminiAttempts,
+      steps: trace.steps,
+    };
+
+    await logActivity(env, entry);
+
+    if (entry.outcome === "error" || entry.outcome === "max-steps") {
+      await kvSetJSON(
+        env,
+        `review:${eventId}`,
+        { eventId, event: eventType, outcome: entry.outcome, error: entry.error, finalText: entry.finalText, ts: finishedAt },
+        LOG_TTL_SECONDS
+      );
+    }
+  } catch (err) {
+    // آخر خط دفاع: استثناء مايتوقعش (زي فشل نداء الجلب التلقائي بره try/catch
+    // خاصة بيه) — لسه بيتسجل هنا بدل ما يضيع بصمت.
+    const finishedAt = isoNow();
+    const errMsg = redactSecret(String((err && err.message) || err), env.ZERNIO_API_KEY);
+    console.error("handleZernioEvent fatal error", eventId, err);
     await logActivity(env, {
       eventId,
       event: eventType,
       trigger,
       timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
-      outcome: "skipped-self-echo",
+      outcome: "internal-error",
+      error: errMsg,
     });
-    return;
-  }
-
-  if (eventType !== "message.received" && eventType !== "comment.received") {
-    const finishedAt = isoNow();
-    await logActivity(env, {
-      eventId,
-      event: eventType,
-      trigger,
-      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
-      outcome: "skipped-unsupported-event",
-    });
-    return;
-  }
-
-  // جلب سياق تلقائي (بكود ثابت) + مؤشر كتابة للـ DM. contextFetched بيتسجل
-  // في اللوج بالكامل عشان تشخيص أي مشكلة في وصول السياق للموديل.
-  let rawEventText = rawBody;
-  let contextFetched = null;
-
-  if (eventType === "message.received") {
-    const ids = extractMessageContext(payload);
-    if (ids) {
-      CALL_HANDLERS.typingIndicator(env, ids).catch(() => {}); // fire-and-forget
-      const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" });
-      contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
-      rawEventText += `\n\nسياق آخر الرسائل (اتجابت تلقائيًا، مفيش داعي تطلبها تاني إلا لو محتاج أكتر من ${AUTO_CONTEXT_LIMIT} أو صفحة تانية):\n${JSON.stringify(history.data).slice(0, 3000)}`;
-    } else {
-      contextFetched = { type: "messages", error: "extractMessageContext فشل يلاقي conversationId/accountId — السياق ماتجابش خالص" };
-    }
-  } else if (eventType === "comment.received") {
-    const ids = extractCommentContext(payload);
-    if (ids) {
-      const history = await CALL_HANDLERS.listComments(env, { ...ids, limit: AUTO_CONTEXT_LIMIT });
-      contextFetched = { type: "comments", ids, ok: history.ok, status: history.status, data: history.data };
-      rawEventText += `\n\nسياق تعليقات البوست ده (اتجابت تلقائيًا، مفيش داعي تطلبها تاني إلا لو محتاج أكتر):\n${JSON.stringify(history.data).slice(0, 3000)}`;
-    } else {
-      contextFetched = { type: "comments", error: "extractCommentContext فشل يلاقي postId/accountId — السياق ماتجابش خالص" };
-    }
-  }
-
-  const trace = await runAgentLoop(env, rawEventText, eventId);
-
-  const finishedAt = isoNow();
-  const entry = {
-    eventId,
-    event: eventType,
-    trigger,
-    timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
-    contextFetched,
-    outcome: trace.stopReason,
-    finalText: trace.finalText,
-    error: trace.error,
-    geminiAttempts: trace.geminiAttempts,
-    steps: trace.steps,
-  };
-
-  await logActivity(env, entry);
-
-  if (entry.outcome === "error" || entry.outcome === "max-steps") {
     await kvSetJSON(
       env,
       `review:${eventId}`,
-      { eventId, event: eventType, outcome: entry.outcome, error: entry.error, finalText: entry.finalText, ts: finishedAt },
+      { eventId, event: eventType, outcome: "internal-error", error: errMsg, ts: finishedAt },
       LOG_TTL_SECONDS
     );
   }
