@@ -1,31 +1,35 @@
 // =============================================================================
-// Zernio Social Inbox Agent — Cloudflare Worker (v6: Workers AI via REST + تشخيص)
+// Zernio Social Inbox Agent — Cloudflare Worker (v7: طابور مضمون + max_tokens)
 // =============================================================================
 //
-// جديد في v6:
+// جديد في v7:
 //
-// 1) Workers AI بقى عن طريق REST API (مش env.AI binding) — نداء fetch عادي
-//    على https://api.cloudflare.com/client/v4/accounts/{id}/ai/run/{model}
-//    بـ Bearer token. محتاج secretين جدد:
-//      CLOUDFLARE_API_TOKEN   — من Dashboard → My Profile → API Tokens
-//                                (صلاحية Workers AI)
-//      CLOUDFLARE_ACCOUNT_ID  — رقم حسابك في Cloudflare
-//    الـ "ai" binding اللي ضفناه في wrangler.jsonc قبل كده بقى غير مستخدم —
-//    مش لازم تشيله (مبيضرش)، بس مش شرط تبقيه.
+// 1) إعادة تصميم معمارية الاستقبال: بدل "عالج فورًا في الخلفية" (ctx.waitUntil)
+//    بقينا نستخدم Cloudflare Queues — /webhook/zernio دلوقتي بيحط الحدث في
+//    طابور بس (env.EVENTS_QUEUE.send(...)) ويرجع 200 فورًا. المعالجة الفعلية
+//    بتحصل في دالة queue() منفصلة (المستهلك/consumer). Cloudflare نفسها
+//    بتضمن التسليم: لو المعالجة فشلت (handleZernioEvent رمى استثناء)،
+//    بتعيد المحاولة تلقائيًا (max_retries)، وبعد استنفادها بتحط الرسالة في
+//    Dead Letter Queue بدل ما تضيع خالص — ده كان أهم مطلب.
+//    محتاج تعمل يدويًا قبل النشر:
+//      npx wrangler queues create zernio-events
+//      npx wrangler queues create zernio-events-dlq
+//    وتضيف في wrangler.jsonc:
+//      "queues": {
+//        "producers": [{ "queue": "zernio-events", "binding": "EVENTS_QUEUE" }],
+//        "consumers": [{
+//          "queue": "zernio-events", "max_batch_size": 5, "max_batch_timeout": 5,
+//          "max_retries": 5, "dead_letter_queue": "zernio-events-dlq"
+//        }]
+//      }
 //
-// 2) ضفنا @cf/google/gemma-3-12b-it لقائمة الموديلات (بدل فكرة gemma-7b-it-lora
-//    القديمة اللي كانت base model لـ LoRA مش موديل محادثة عادي). الترتيب
-//    الحالي (افتراض مني، قابل للتغيير): deepseek-r1-distill-qwen-32b ثم
-//    llama-3.2-11b-vision-instruct ثم gemma-3-12b-it ثم Gemini أخيرًا.
+// 2) استبدال @cf/deepseek-ai/deepseek-r1-distill-qwen-32b (موديل تفكير كان
+//    بيدخل في <think> طويل وبيقطع رده قبل ما يوصل لـ JSON خالص، وده كان
+//    السبب الحقيقي وراء عدم الرد على نسبة كبيرة من الرسائل) بـ
+//    @cf/meta/llama-3.2-3b-instruct — موديل مباشر بدون تفكير، أخف وأسرع.
 //
-// 3) كل log entry دلوقتي فيه حقل "contextFetched" بيوضح بالظبط السياق اللي
-//    اتجاب تلقائيًا (listMessages/listComments) قبل أول دور للموديل — أو
-//    سبب الفشل لو الاستخراج (conversationId/accountId أو postId/accountId)
-//    فشل من الأساس. ده عشان تشخيص مشكلة "الموديل مش عارف يجيب السياق"
-//    بالدليل مش بالتخمين.
-//
-// 4) /health بقى فيه حقل "tools" (تحت "zernioRest" مباشرة) بقائمة مرجعية
-//    لكل الـ operations المتاحة للموديل، للتذكرة بس.
+// 3) إضافة max_tokens=1024 صريح لنداءات Workers AI — القيمة الافتراضية عند
+//    Cloudflare 256 بس، ودي كانت بتساهم في مشكلة القطع في رقم 2.
 //
 // ⚠️ postId في حدث comment.received لازم يكون platformPostId (مش postId/id
 // اللي ممكن يوصلوا فاضيين لو البوست مش منشور من خلال Zernio نفسها).
@@ -38,8 +42,8 @@
 //   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
 //   GEMINI_MODELS (اختياري), STATUS_KEY (اختياري)
 //
-// Binding المطلوب في wrangler.jsonc: ZERNIO_KV (KV) بس. الـ "ai" binding
-// اختياري دلوقتي (مش مستخدم).
+// Bindings المطلوبة في wrangler.jsonc: ZERNIO_KV (KV)، EVENTS_QUEUE (Queue
+// producer/consumer زي فوق). الـ "ai" binding القديم اختياري (مش مستخدم).
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -51,8 +55,8 @@ const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 // الترتيب = ترتيب المحاولة الفعلي.
 const WORKERS_AI_MODELS = [
-  "@cf/google/gemma-7b-it-lora",
-  "@@cf/google/gemma-3-12b-it",
+  "@cf/meta/llama-3.2-3b-instruct",
+  "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it",
 ];
 
@@ -70,6 +74,10 @@ const CALL_TIMEOUT_MS = 15000;
 // حد أقصى لوقت نداء موديل واحد (Workers AI عن طريق REST) — أسخى شوية لأن
 // موديلات التفكير (reasoning) ممكن تاخد وقت أطول.
 const AI_CALL_TIMEOUT_MS = 30000;
+
+// حد التوكينز لرد الموديل — الافتراضي عند Cloudflare 256 بس، ده اللي كان
+// بيخلي موديل التفكير القديم يقطع رده في نص الكلام قبل ما يوصل لـ JSON.
+const WORKERS_AI_MAX_TOKENS = 1024;
 
 // كام رسالة/تعليق نجيبهم تلقائيًا كسياق قبل أول دور للموديل.
 const AUTO_CONTEXT_LIMIT = 20;
@@ -457,7 +465,7 @@ async function callWorkersAiTurn(env, contents, systemInstruction, combo, attemp
           Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ messages, response_format: { type: "json_object" } }),
+        body: JSON.stringify({ messages, response_format: { type: "json_object" }, max_tokens: WORKERS_AI_MAX_TOKENS }),
       }),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error(`انتهت مهلة نداء Workers AI (${AI_CALL_TIMEOUT_MS / 1000}s)`)), AI_CALL_TIMEOUT_MS)
@@ -787,27 +795,37 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
         { eventId, event: eventType, outcome: entry.outcome, error: entry.error, finalText: entry.finalText, ts: finishedAt },
         LOG_TTL_SECONDS
       );
+      // نرمي استثناء (بعد ما سجّلنا كل حاجة فوق) عشان الطابور (Cloudflare
+      // Queues) يمسك الفشل ده ويعيد المحاولة تلقائيًا — بعد استنفاد
+      // max_retries، الرسالة بتروح لـ Dead Letter Queue بدل ما تضيع.
+      throw new Error(`retry-requested:${entry.outcome}`);
     }
   } catch (err) {
-    // آخر خط دفاع: استثناء مايتوقعش (زي فشل نداء الجلب التلقائي بره try/catch
-    // خاصة بيه) — لسه بيتسجل هنا بدل ما يضيع بصمت.
     const finishedAt = isoNow();
     const errMsg = redactSecret(String((err && err.message) || err), env.ZERNIO_API_KEY);
-    console.error("handleZernioEvent fatal error", eventId, err);
-    await logActivity(env, {
-      eventId,
-      event: eventType,
-      trigger,
-      timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
-      outcome: "internal-error",
-      error: errMsg,
-    });
-    await kvSetJSON(
-      env,
-      `review:${eventId}`,
-      { eventId, event: eventType, outcome: "internal-error", error: errMsg, ts: finishedAt },
-      LOG_TTL_SECONDS
-    );
+    console.error("handleZernioEvent error", eventId, err);
+    // لو الاستثناء ده هو الـ "retry-requested" اللي رميناه إحنا فوق بعد ما
+    // سجّلنا كل حاجة خلاص، متسجلش تاني. أي استثناء تاني (غير متوقع، زي فشل
+    // الجلب التلقائي للسياق) بيتسجل هنا كـ شبكة أمان أخيرة.
+    if (!errMsg.startsWith("retry-requested:")) {
+      await logActivity(env, {
+        eventId,
+        event: eventType,
+        trigger,
+        timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
+        outcome: "internal-error",
+        error: errMsg,
+      });
+      await kvSetJSON(
+        env,
+        `review:${eventId}`,
+        { eventId, event: eventType, outcome: "internal-error", error: errMsg, ts: finishedAt },
+        LOG_TTL_SECONDS
+      );
+    }
+    // نعيد رمي الاستثناء لغاية استهلاك الطابور (queue consumer) — هو اللي
+    // بيقرر يعيد المحاولة (message.retry()) اعتمادًا على وجود استثناء هنا.
+    throw err;
   }
 }
 
@@ -815,7 +833,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 // 7) استقبال الـ webhook (تحقق توقيع + dedup + رد سريع + معالجة خلفية)
 // -----------------------------------------------------------------------------
 
-async function handleWebhook(request, env, ctx) {
+async function handleWebhook(request, env) {
   const receivedAt = isoNow();
   const rawBody = await request.text();
 
@@ -865,7 +883,11 @@ async function handleWebhook(request, env, ctx) {
     await env.ZERNIO_KV.put(dedupKey, "1", { expirationTtl: DEDUP_TTL_SECONDS }).catch(() => {});
   }
 
-  ctx.waitUntil(handleZernioEvent(env, rawBody, payload, receivedAt));
+  // بدل المعالجة الفورية في الخلفية، بنحط الحدث في طابور مضمون التسليم —
+  // Cloudflare نفسها بتضمن وصول الرسالة وتعيد المحاولة تلقائيًا لو
+  // المعالجة فشلت، وبعد استنفاد المحاولات بتحطها في Dead Letter Queue بدل
+  // ما تضيع خالص.
+  await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
 
   return jsonResponse({ ok: true });
 }
@@ -1025,7 +1047,7 @@ export default {
 
     try {
       if (request.method === "POST" && url.pathname === "/webhook/zernio") {
-        return await handleWebhook(request, env, ctx);
+        return await handleWebhook(request, env);
       }
 
       if (request.method === "GET" && url.pathname === "/webhook/zernio") {
@@ -1049,6 +1071,25 @@ export default {
       console.error("Unhandled fetch error", err);
       await logActivity(env, { event: "webhook", outcome: "fatal-error", error: err.message, timing: { receivedAt: isoNow() } }).catch(() => {});
       return jsonResponse({ ok: false, error: err.message }, 500);
+    }
+  },
+
+  // مستهلك الطابور (Cloudflare Queues) — بيستقبل الأحداث اللي handleWebhook
+  // حطها في الطابور، ويعالج كل واحدة فعليًا. لو نجحت، بنأكدها (ack) وتتشال
+  // من الطابور. لو فشلت (handleZernioEvent رمى استثناء)، بنطلب إعادة
+  // المحاولة (retry) — Cloudflare بتعيد المحاولة تلقائيًا حسب max_retries
+  // المتظبطة في wrangler.jsonc، وبعد استنفادها بتحط الرسالة في Dead Letter
+  // Queue بدل ما تضيع خالص.
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      const { rawBody, payload, receivedAt } = message.body || {};
+      try {
+        await handleZernioEvent(env, rawBody, payload, receivedAt);
+        message.ack();
+      } catch (err) {
+        console.error("queue consumer retry", payload && payload.id, err && err.message);
+        message.retry();
+      }
     }
   },
 };
