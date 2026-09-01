@@ -650,15 +650,20 @@ async function runAgentLoop(env, rawEventText, eventId) {
     return { steps: [], finalText: null, stopReason: "error", error: "مفيش أي provider متظبط", geminiAttempts: [] };
   }
 
+  // بنجمع محاولات كل الـ providers مع بعض (مش بس آخر واحد) عشان نشوف
+  // السلسلة كاملة في اللوج: Workers AI التلاتة فشلوا ليه، وGemini اتصرف
+  // إزاي بعد كده.
+  const allAttempts = [];
   let lastResult = null;
   for (const combo of combos) {
     const result = await runAgentLoopWithModel(env, rawEventText, combo, eventId);
-    if (result.ok) return result;
-    lastResult = result;
+    allAttempts.push(...(result.geminiAttempts || []));
+    if (result.ok) return { ...result, geminiAttempts: allAttempts };
+    lastResult = { ...result, geminiAttempts: allAttempts };
     const hadRealAction = result.steps.some((s) => s.type === "call");
-    if (hadRealAction) return result;
+    if (hadRealAction) return lastResult;
   }
-  return lastResult || { steps: [], finalText: null, stopReason: "error", error: "كل الموديلات فشلت", geminiAttempts: [] };
+  return lastResult || { steps: [], finalText: null, stopReason: "error", error: "كل الموديلات فشلت", geminiAttempts: allAttempts };
 }
 
 // -----------------------------------------------------------------------------
@@ -814,6 +819,17 @@ async function handleWebhook(request, env, ctx) {
   const receivedAt = isoNow();
   const rawBody = await request.text();
 
+  // سجل غير مشروط: أي طلب POST يوصل هنا بيتسجل فورًا، قبل أي تحقق أو رفض —
+  // عشان نضمن إن مفيش webhook بيوصل ويختفي من غير أثر خالص، حتى لو فشل في
+  // أي خطوة بعد كده (توقيع غلط، JSON غير صالح...).
+  await logActivity(env, {
+    event: "webhook-received",
+    outcome: "arrived",
+    timing: { receivedAt },
+    hasSignatureHeader: !!request.headers.get("X-Zernio-Signature"),
+    bodyPreview: rawBody.length > 200 ? rawBody.slice(0, 200) + "…" : rawBody,
+  });
+
   const signature = request.headers.get("X-Zernio-Signature");
   if (!signature) {
     await logActivity(env, { event: "webhook", outcome: "rejected-no-signature", timing: { receivedAt } });
@@ -922,7 +938,85 @@ async function handleReviewQueue(request, env) {
 }
 
 // -----------------------------------------------------------------------------
-// 10) نقطة الدخول الرئيسية
+// 10) /dashboard — صفحة متابعة بشرية بتحدّث نفسها لوحدها كل 5 ثواني
+// -----------------------------------------------------------------------------
+
+async function handleDashboard(request, env) {
+  const url = new URL(request.url);
+  if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
+    return textResponse("Unauthorized. ضيف ?key=... في الرابط.", 401);
+  }
+  const keyQs = env.STATUS_KEY ? `?key=${encodeURIComponent(url.searchParams.get("key"))}` : "";
+
+  const html = `<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>لوحة متابعة Zernio Agent</title>
+<style>
+  body { background:#0b0e14; color:#d8dee9; font-family: -apple-system, "Segoe UI", Tahoma, sans-serif; margin:0; padding:16px; }
+  h1 { font-size:16px; color:#8fd3ff; margin:0 0 8px; }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; font-size:13px; }
+  .pill { background:#171b26; border-radius:6px; padding:6px 10px; }
+  .ok { color:#7ee787; } .bad { color:#ff7b72; }
+  .entry { background:#111520; border:1px solid #222736; border-radius:8px; padding:10px 12px; margin-bottom:8px; font-size:13px; }
+  .entry .top { display:flex; justify-content:space-between; gap:8px; color:#8b94a8; font-size:12px; margin-bottom:4px; }
+  .out-error, .out-internal-error, .out-max-steps { color:#ff7b72; font-weight:bold; }
+  .out-final { color:#7ee787; font-weight:bold; }
+  .out-skipped-self-echo, .out-skipped-unsupported-event, .out-arrived, .out-dedup-skip { color:#8b94a8; }
+  pre { white-space:pre-wrap; word-break:break-word; margin:4px 0 0; color:#c9d1d9; font-size:12px; }
+  #status { font-size:12px; color:#8b94a8; margin-bottom:10px; }
+</style>
+</head>
+<body>
+<h1>لوحة متابعة Zernio Social Inbox Agent — بتحدّث نفسها كل 5 ثواني</h1>
+<div id="status">بيحمل...</div>
+<div class="bar" id="bar"></div>
+<div id="logs"></div>
+<script>
+async function refresh() {
+  try {
+    const res = await fetch('/health${keyQs}');
+    const data = await res.json();
+    document.getElementById('status').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar-EG');
+    var bar = document.getElementById('bar');
+    var zc = data.zernioRest && data.zernioRest.connected;
+    bar.innerHTML =
+      '<div class="pill">Zernio: <span class="' + (zc ? 'ok' : 'bad') + '">' + (zc ? 'متصل' : 'غير متصل') + '</span></div>' +
+      '<div class="pill">حسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</div>';
+    var logsEl = document.getElementById('logs');
+    var items = data.logs || [];
+    logsEl.innerHTML = items.map(function(e) {
+      var outcome = e.outcome || '';
+      return '<div class="entry">' +
+        '<div class="top"><span>' + esc(e.event || '') + ' — ' + esc(e.eventId || '') + '</span>' +
+        '<span class="out-' + esc(outcome) + '">' + esc(outcome) + '</span></div>' +
+        '<div>' + esc((e.timing && e.timing.receivedAt) || '') + (e.timing && typeof e.timing.durationMs === 'number' ? ' — ' + e.timing.durationMs + 'ms' : '') + '</div>' +
+        (e.finalText ? '<pre>' + esc(e.finalText) + '</pre>' : '') +
+        (e.error ? '<pre style="color:#ff7b72">' + esc(e.error) + '</pre>' : '') +
+      '</div>';
+    }).join('') || '<div>مفيش أحداث لسه</div>';
+  } catch (err) {
+    document.getElementById('status').textContent = 'فشل التحديث: ' + err.message;
+  }
+}
+function esc(s) {
+  var d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// -----------------------------------------------------------------------------
+// 11) نقطة الدخول الرئيسية
 // -----------------------------------------------------------------------------
 
 export default {
@@ -944,6 +1038,10 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/health/review") {
         return await handleReviewQueue(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/dashboard") {
+        return await handleDashboard(request, env);
       }
 
       return textResponse("Not found", 404);
