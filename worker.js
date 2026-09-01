@@ -51,8 +51,8 @@ const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 // الترتيب = ترتيب المحاولة الفعلي.
 const WORKERS_AI_MODELS = [
-  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-  "@cf/meta/llama-3.2-11b-vision-instruct",
+  "@cf/google/gemma-7b-it-lora",
+  "@@cf/google/gemma-3-12b-it",
   "@cf/google/gemma-3-12b-it",
 ];
 
