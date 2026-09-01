@@ -3,7 +3,7 @@
   "name": "zernio-social-inbox-agent",
   "main": "worker.js",
   "compatibility_date": "2025-06-01",
-  // KV namespace لتخزين: dedup الأحداث، كاش الأدوات المكتشفة، وسجل المتابعة.
+  // KV namespace لتخزين: dedup الأحداث، اللوج، وطابور المراجعة.
   // أنشئه أولًا بالأمر:
   //   npx wrangler kv namespace create ZERNIO_KV
   // وحط الـ id اللي هيطلعلك بدل "REPLACE_WITH_YOUR_KV_ID".
@@ -13,11 +13,27 @@
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
   ],
-  // Workers AI — عشان env.AI.run() يشتغل (deepseek-r1-distill-qwen-32b ثم
-  // llama-3.2-11b-vision-instruct كـ fallback مجاني قبل Gemini). مجاني
-  // (10,000 نيورون/يوم)، مفيهوش أي secret أو account id إضافي محتاج يتحط
-  // هنا — الـ binding نفسه هو كل اللي محتاجه، وربطه بحسابك بيحصل تلقائيًا
-  // وقت النشر.
+  // Cloudflare Queues — طابور مضمون التسليم بين استقبال الـ webhook (يحط
+  // الحدث في الطابور بس) ومعالجته الفعلية (queue() consumer). لازم تنشئهم
+  // الأول بالأمرين دول (مجاني — 10,000 عملية يوميًا):
+  //   npx wrangler queues create zernio-events
+  //   npx wrangler queues create zernio-events-dlq
+  "queues": {
+    "producers": [
+      { "queue": "zernio-events", "binding": "EVENTS_QUEUE" }
+    ],
+    "consumers": [
+      {
+        "queue": "zernio-events",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "zernio-events-dlq"
+      }
+    ]
+  },
+  // Workers AI القديمة — مش مستخدمة دلوقتي (بقينا بنستخدم REST مباشرة)،
+  // سايبها موجودة لأنها مبتضرش، مش شرط تبقيها.
   "ai": {
     "binding": "AI"
   }
@@ -25,6 +41,8 @@
   //   npx wrangler secret put ZERNIO_API_KEY
   //   npx wrangler secret put ZERNIO_WEBHOOK_SECRET
   //   npx wrangler secret put GEMINI_API_KEY
+  //   npx wrangler secret put CLOUDFLARE_API_TOKEN
+  //   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
   //   npx wrangler secret put STATUS_KEY        (اختياري)
   //   npx wrangler secret put GEMINI_MODELS      (اختياري)
   // أو من Cloudflare Dashboard → Workers → اسم الـ Worker → Settings →
