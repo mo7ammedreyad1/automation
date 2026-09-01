@@ -60,7 +60,7 @@ const WORKERS_AI_MODELS = [
   "@cf/google/gemma-3-12b-it",
 ];
 
-const DEFAULT_GEMINI_MODELS = ["emma-4-26b-a4b-it"];
+const DEFAULT_GEMINI_MODELS = ["gemma-4-26b-a4b-it"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
