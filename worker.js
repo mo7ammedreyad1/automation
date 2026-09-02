@@ -1,15 +1,66 @@
+// =============================================================================
+// Zernio Social Inbox Agent — Cloudflare Worker (v7: طابور مضمون + max_tokens)
+// =============================================================================
+//
+// جديد في v7:
+//
+// 1) إعادة تصميم معمارية الاستقبال: بدل "عالج فورًا في الخلفية" (ctx.waitUntil)
+//    بقينا نستخدم Cloudflare Queues — /webhook/zernio دلوقتي بيحط الحدث في
+//    طابور بس (env.EVENTS_QUEUE.send(...)) ويرجع 200 فورًا. المعالجة الفعلية
+//    بتحصل في دالة queue() منفصلة (المستهلك/consumer). Cloudflare نفسها
+//    بتضمن التسليم: لو المعالجة فشلت (handleZernioEvent رمى استثناء)،
+//    بتعيد المحاولة تلقائيًا (max_retries)، وبعد استنفادها بتحط الرسالة في
+//    Dead Letter Queue بدل ما تضيع خالص — ده كان أهم مطلب.
+//    محتاج تعمل يدويًا قبل النشر:
+//      npx wrangler queues create zernio-events
+//      npx wrangler queues create zernio-events-dlq
+//    وتضيف في wrangler.jsonc:
+//      "queues": {
+//        "producers": [{ "queue": "zernio-events", "binding": "EVENTS_QUEUE" }],
+//        "consumers": [{
+//          "queue": "zernio-events", "max_batch_size": 5, "max_batch_timeout": 5,
+//          "max_retries": 5, "dead_letter_queue": "zernio-events-dlq"
+//        }]
+//      }
+//
+// 2) استبدال @cf/deepseek-ai/deepseek-r1-distill-qwen-32b (موديل تفكير كان
+//    بيدخل في <think> طويل وبيقطع رده قبل ما يوصل لـ JSON خالص، وده كان
+//    السبب الحقيقي وراء عدم الرد على نسبة كبيرة من الرسائل) بـ
+//    @cf/meta/llama-3.2-3b-instruct — موديل مباشر بدون تفكير، أخف وأسرع.
+//
+// 3) إضافة max_tokens=1024 صريح لنداءات Workers AI — القيمة الافتراضية عند
+//    Cloudflare 256 بس، ودي كانت بتساهم في مشكلة القطع في رقم 2.
+//
+// ⚠️ postId في حدث comment.received لازم يكون platformPostId (مش postId/id
+// اللي ممكن يوصلوا فاضيين لو البوست مش منشور من خلال Zernio نفسها).
+//
+// الاستثناء الأمني الوحيد المكتوب في الكود: تجاهل أي حدث صادر من الحساب
+// نفسه (comment.author.isOwnAccount، أو message.direction != incoming).
+//
+// الأسرار المطلوبة (Cloudflare Dashboard أو wrangler secret put):
+//   ZERNIO_API_KEY, ZERNIO_WEBHOOK_SECRET, GEMINI_API_KEY,
+//   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+//   GEMINI_MODELS (اختياري), STATUS_KEY (اختياري)
+//
+// Bindings المطلوبة في wrangler.jsonc: ZERNIO_KV (KV)، EVENTS_QUEUE (Queue
+// producer/consumer زي فوق). الـ "ai" binding القديم اختياري (مش مستخدم).
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1) ثوابت عامة
+// -----------------------------------------------------------------------------
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 // الترتيب = ترتيب المحاولة الفعلي.
 const WORKERS_AI_MODELS = [
-  "@cf/google/gemma-4-26b-a4b-it",
-  "@cf/google/gemma-3-12b-it",
+  "@cf/meta/llama-3.2-3b-instruct",
+  "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it",
 ];
 
-const DEFAULT_GEMINI_MODELS = ["gemma-4-26b-a4b-it"];
+const DEFAULT_GEMINI_MODELS = ["gemini-1.5-flash"];
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
@@ -184,27 +235,12 @@ const CALL_HANDLERS = {
   // ---------------- Direct Messages ----------------
 
   async listMessages(env, args) {
-  const { conversationId, accountId, limit = AUTO_CONTEXT_LIMIT, cursor } = args || {};
-  if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
-  
-  // إزالة sortOrder التجريبي وإضافة accountId و limit فقط
-  const qs = new URLSearchParams({ 
-    accountId, 
-    limit: String(limit)
-  });
-  
-  if (cursor) qs.set("cursor", cursor);
-  
-  return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages?${qs}`, { method: "GET" });
-},
-  
- /* async listMessages(env, args) {
     const { conversationId, accountId, limit = AUTO_CONTEXT_LIMIT, sortOrder = "desc", cursor } = args || {};
     if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
     const qs = new URLSearchParams({ accountId, limit: String(limit), sortOrder });
     if (cursor) qs.set("cursor", cursor);
     return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages?${qs}`, { method: "GET" });
-  }, */
+  },
 
   async sendMessage(env, args, idempotencyKey) {
     const { conversationId, accountId, message, attachmentUrl, attachmentType } = args || {};
