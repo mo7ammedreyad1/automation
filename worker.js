@@ -63,7 +63,7 @@ const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 // الترتيب = ترتيب المحاولة الفعلي.
 const WORKERS_AI_MODELS = [
-  "@cf/meta/llama-3.2-3b-instruct",
+  "@cf/google/gemma-3-12b-it",
   "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it",
 ];
