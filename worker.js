@@ -1,5 +1,5 @@
 // =============================================================================
-// Zernio SaaS Agent Worker (v9: Full Agent Loop + API Proxy + Custom Prompt)
+// Zernio SaaS Agent Worker (v9.1: Diagnostic & Debugging Enabled)
 // =============================================================================
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
@@ -11,7 +11,7 @@ const WORKERS_AI_MODELS = [
   "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it",
 ];
-const DEFAULT_GEMINI_MODELS = ["gemma-4-31b-it"];
+const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite"];
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -22,7 +22,7 @@ const AI_CALL_TIMEOUT_MS = 30000;
 const WORKERS_AI_MAX_TOKENS = 1024;
 const AUTO_CONTEXT_LIMIT = 20;
 
-// إعدادات CORS للسماح لتطبيقك الأمامي بالاتصال بالـ Worker
+// إعدادات CORS للسماح لتطبيقك وصفحة الاختبار بالاتصال بالـ Worker
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -30,77 +30,188 @@ const corsHeaders = {
 };
 
 // -----------------------------------------------------------------------------
-// 1) API PROXY: Endpoints الخاصة بواجهة التطبيق لإخفاء المفاتيح
+// 1) API PROXY: Endpoints الخاصة بالتطبيق مع فحص تشخيصي دقيق للـ Profile ID
 // -----------------------------------------------------------------------------
 async function handleApiRequests(request, env, url) {
     const path = url.pathname;
-    const API_KEY = env.ZERNIO_API_KEY;
-    const PROFILE_ID = env.ZERNIO_PROFILE_ID;
+    const rawApiKey = env.ZERNIO_API_KEY || '';
+    const rawProfileId = env.ZERNIO_PROFILE_ID || '';
 
-    // 1. مسار حفظ تعليمات العميل (System Prompt) في ذاكرة الـ KV
+    const API_KEY = rawApiKey.trim();
+    const PROFILE_ID = rawProfileId.trim();
+
+    // 1. مسار حفظ تعليمات العميل (System Prompt) في الـ KV
     if (request.method === 'POST' && path === '/api/set-prompt') {
-        const body = await request.json();
-        if (!body.prompt) return new Response('Missing prompt', { status: 400, headers: corsHeaders });
+        const body = await request.json().catch(() => ({}));
+        if (!body.prompt) {
+            return new Response(JSON.stringify({ error: 'حقل prompt مفقود في الطلب' }), { 
+                status: 400, 
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
         await env.ZERNIO_KV.put('custom_agent_prompt', body.prompt);
-        return new Response(JSON.stringify({ ok: true, message: 'تم حفظ التعليمات في البوت بنجاح' }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+        return new Response(JSON.stringify({ ok: true, message: 'تم حفظ التعليمات في البوت بنجاح' }), { 
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    // فحص تشخيصي مشترك للـ Profile ID والـ API Key قبل التوجيه لـ Zernio
+    function validateCredentials() {
+        if (!API_KEY) {
+            return {
+                valid: false,
+                response: new Response(JSON.stringify({
+                    error: "مفتاح ZERNIO_API_KEY غير موجود في Cloudflare Variables.",
+                    actionRequired: "اذهب إلى Settings -> Variables في لوحة Cloudflare وأضف متغير باسم ZERNIO_API_KEY وضع قيمته sk_..."
+                }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+            };
+        }
+
+        if (!PROFILE_ID) {
+            return {
+                valid: false,
+                response: new Response(JSON.stringify({
+                    error: "معرف ZERNIO_PROFILE_ID غير موجود أو فارغ.",
+                    actionRequired: "تأكد من تسمية المتغير بـ ZERNIO_PROFILE_ID في Cloudflare Variables وليس PROFILE_ID فقط."
+                }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+            };
+        }
+
+        // Zernio يتطلب Mongo ObjectId (24 حرف بنظام الـ Hexadecimal)
+        const isMongoObjectId = /^[0-9a-fA-F]{24}$/.test(PROFILE_ID);
+        if (!isMongoObjectId) {
+            return {
+                valid: false,
+                response: new Response(JSON.stringify({
+                    error: "صيغة ZERNIO_PROFILE_ID غير صالحة محلياً قبل الإرسال لـ Zernio.",
+                    diagnostic: {
+                        receivedValue: PROFILE_ID,
+                        valueLength: PROFILE_ID.length,
+                        expectedFormat: "24 حرف/رقم بنظام Hex (مثل: 6a8caec32b562566622cf28d)"
+                    },
+                    actionRequired: "تأكد أنك نسخت Profile ID الحقيقي من داخل حساب Zernio وليس Account ID أو اسم الحساب."
+                }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+            };
+        }
+
+        return { valid: true };
     }
 
     // 2. مسار جلب رابط تفويض الفيسبوك
     if (request.method === 'GET' && path === '/api/auth/facebook') {
-        const redirectUrl = url.searchParams.get('redirect_url');
+        const check = validateCredentials();
+        if (!check.valid) return check.response;
+
+        const redirectUrl = url.searchParams.get('redirect_url') || '';
         const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
-        const res = await fetch(zernioUrl, { headers: { 'Authorization': `Bearer ${API_KEY}` } });
-        return new Response(res.body, { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+
+        const res = await fetch(zernioUrl, { 
+            headers: { 
+                'Authorization': `Bearer ${API_KEY}`,
+                'Content-Type': 'application/json'
+            } 
+        });
+
+        const data = await res.json().catch(() => ({}));
+        
+        // إذا رجع خطأ من Zernio نُرفق معه البيانات التشخيصية لسهولة المعرفة
+        if (!res.ok) {
+            return new Response(JSON.stringify({
+                zernioError: data,
+                diagnosticInfo: {
+                    sentProfileId: PROFILE_ID,
+                    profileIdLength: PROFILE_ID.length,
+                    statusReturned: res.status
+                }
+            }, null, 2), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+
+        return new Response(JSON.stringify(data), { 
+            status: res.status, 
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
     }
 
     // 3. مسار تأكيد ربط صفحة الفيسبوك
     if (request.method === 'POST' && path === '/api/auth/facebook/select') {
-        const body = await request.json();
+        const check = validateCredentials();
+        if (!check.valid) return check.response;
+
+        const body = await request.json().catch(() => ({}));
         body.profileId = PROFILE_ID; 
+
         const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page`;
         const res = await fetch(zernioUrl, { 
             method: 'POST', 
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
-        return new Response(res.body, { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+        const data = await res.json().catch(() => ({}));
+        return new Response(JSON.stringify(data), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
     }
 
     // 4. مسار جلب رابط تفويض الإنستغرام
     if (request.method === 'GET' && path === '/api/auth/instagram') {
-        const redirectUrl = url.searchParams.get('redirect_url');
+        const check = validateCredentials();
+        if (!check.valid) return check.response;
+
+        const redirectUrl = url.searchParams.get('redirect_url') || '';
         const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
         const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram?profileId=${PROFILE_ID}&headless=true&loginMethod=${loginMethod}&redirect_url=${encodeURIComponent(redirectUrl)}`;
-        const res = await fetch(zernioUrl, { headers: { 'Authorization': `Bearer ${API_KEY}` } });
-        return new Response(res.body, { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+
+        const res = await fetch(zernioUrl, { 
+            headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' } 
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+            return new Response(JSON.stringify({
+                zernioError: data,
+                diagnosticInfo: {
+                    sentProfileId: PROFILE_ID,
+                    statusReturned: res.status
+                }
+            }, null, 2), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+
+        return new Response(JSON.stringify(data), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
     }
 
     // 5. مسار جلب حسابات الإنستغرام
     if (request.method === 'GET' && path === '/api/auth/instagram/accounts') {
+        const check = validateCredentials();
+        if (!check.valid) return check.response;
+
         const tempToken = url.searchParams.get('tempToken');
         const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${PROFILE_ID}&tempToken=${tempToken}`;
         const res = await fetch(zernioUrl, { headers: { 'Authorization': `Bearer ${API_KEY}` } });
-        return new Response(res.body, { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+        const data = await res.json().catch(() => ({}));
+        return new Response(JSON.stringify(data), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
     }
 
     // 6. مسار تأكيد ربط حساب الإنستغرام
     if (request.method === 'POST' && path === '/api/auth/instagram/select') {
-        const body = await request.json();
+        const check = validateCredentials();
+        if (!check.valid) return check.response;
+
+        const body = await request.json().catch(() => ({}));
         body.profileId = PROFILE_ID;
+
         const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account`;
         const res = await fetch(zernioUrl, { 
             method: 'POST', 
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
-        return new Response(res.body, { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+        const data = await res.json().catch(() => ({}));
+        return new Response(JSON.stringify(data), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
     }
 
-    return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: 'المسار غير موجود (Endpoint not found)' }), { status: 404, headers: corsHeaders });
 }
 
 // -----------------------------------------------------------------------------
-// 2) أدوات مساعدة عامة (من كودك الأصلي)
+// 2) أدوات مساعدة عامة
 // -----------------------------------------------------------------------------
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), { status, headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders } });
@@ -152,11 +263,11 @@ function redactSecret(text, secret) {
 }
 
 // -----------------------------------------------------------------------------
-// 3) كتالوج العمليات المسموحة (CALL HANDLERS) - كودك الأصلي
+// 3) كتالوج العمليات المسموحة (CALL HANDLERS)
 // -----------------------------------------------------------------------------
 async function zernioFetch(env, path, options = {}) {
   const url = `${ZERNIO_API_BASE}${path}`;
-  const headers = Object.assign({ Authorization: `Bearer ${env.ZERNIO_API_KEY}` }, options.body ? { "Content-Type": "application/json" } : {}, options.headers || {});
+  const headers = Object.assign({ Authorization: `Bearer ${(env.ZERNIO_API_KEY || '').trim()}` }, options.body ? { "Content-Type": "application/json" } : {}, options.headers || {});
   const res = await Promise.race([
     fetch(url, { ...options, headers }),
     new Promise((_, reject) => setTimeout(() => reject(new Error(`انتهت مهلة نداء REST`)), CALL_TIMEOUT_MS))
@@ -258,26 +369,24 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) العقل المدبر والموديلات (الذكاء الاصطناعي)
+// 4) محرك الذكاء الاصطناعي مع دمج الـ System Prompt من KV
 // -----------------------------------------------------------------------------
-
-// 🔥 جلب وإعداد الـ System Prompt بدمج تعليمات العميل مع تعليمات الـ Engine
 async function getDynamicSystemInstruction(env) {
   let customPrompt = await env.ZERNIO_KV.get('custom_agent_prompt');
-  if (!customPrompt) customPrompt = "أنت وكيل خدمة عملاء ذكي ومحترف.";
+  if (!customPrompt) customPrompt = "أنت وكيل خدمة عملاء ذكي ومحترف، ترد بلباقة على استفسارات العملاء.";
 
   return [
     "=== تعليمات شخصية الوكيل (أولويات قصوى) ===",
     customPrompt,
     "",
     "=== قواعد عمل النظام (يجب الالتزام بها حرفياً) ===",
-    "أنت وكيل ذكي بيرد على رسائل הـ Direct Messages والتعليقات.",
+    "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات.",
     "حدثين بس: event = \"message.received\" أو event = \"comment.received\".",
     "طريقة الرد (مهم جدًا): كل رد منك لازم يكون كائن JSON واحد بس، بواحد من الشكلين دول بالظبط:",
     '1) {"action": "call", "calls": [{"name": "اسم العملية", "args": {...}}, ...], "done": true}',
     '2) {"action": "final", "text": "..."}',
     "",
-    "── كتالوج הـ DM (event = message.received) ──",
+    "── كتالوج الـ DM (event = message.received) ──",
     '- sendMessage — args: { conversationId, accountId, message? (نص), attachmentUrl? }',
     '- addReaction — args: { conversationId, accountId, messageId, emoji }',
     "",
@@ -369,9 +478,6 @@ async function callModelTurn(env, contents, systemInstruction, combo, attemptsLo
   return callGeminiTurnFixed(env, contents, systemInstruction, combo, attemptsLog);
 }
 
-// -----------------------------------------------------------------------------
-// 5) حلقة الوكيل: Plan → Act → Reflect
-// -----------------------------------------------------------------------------
 async function runAgentLoopWithModel(env, rawEventText, combo, eventId) {
   const systemInstruction = await getDynamicSystemInstruction(env);
   const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
@@ -411,7 +517,7 @@ async function runAgentLoop(env, rawEventText, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) معالجة الحدث الوارد (Webhook)
+// 5) معالجة الأحداث الواردة من Zernio
 // -----------------------------------------------------------------------------
 function extractAccountId(payload) { return (payload.account && (payload.account.id || payload.account.accountId)) || null; }
 function extractMessageContext(payload) { return { conversationId: payload.message?.conversationId, accountId: extractAccountId(payload) }; }
@@ -424,7 +530,6 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
   if (eventType === "message.received" || eventType === "comment.received") {
     let rawEventText = rawBody;
     
-    // جلب السياق التلقائي للمحادثة
     if (eventType === "message.received") {
       const ids = extractMessageContext(payload);
       if (ids.conversationId) {
@@ -440,24 +545,29 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       }
     }
 
-    // إرسال السياق والحدث لحلقة الذكاء الاصطناعي
     await runAgentLoop(env, rawEventText, eventId);
   }
 }
 
 // -----------------------------------------------------------------------------
-// 7) نقطة الدخول (Fetch & Queue)
+// 6) نقطة الدخول (Fetch & Queue)
 // -----------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
-    if (url.pathname.startsWith('/api/')) return await handleApiRequests(request, env, url);
+    
+    // توجيه مسارات الـ API التشخيصية
+    if (url.pathname.startsWith('/api/')) {
+        return await handleApiRequests(request, env, url);
+    }
 
+    // استقبال الـ Webhook
     if (request.method === "POST" && url.pathname === "/webhook/zernio") {
       const rawBody = await request.text();
-      const payload = JSON.parse(rawBody);
+      let payload;
+      try { payload = JSON.parse(rawBody); } catch (_) { return textResponse("Invalid JSON", 400); }
 
       if (env.EVENTS_QUEUE) {
         await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt: isoNow() });
