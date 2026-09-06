@@ -259,26 +259,40 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(data, res.status);
   }
 
-  if (request.method === 'GET' && path === '/api/auth/instagram/accounts') {
-    const tempToken = url.searchParams.get('tempToken');
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${PROFILE_ID}&tempToken=${tempToken}`;
-    const res = await fetch(zernioUrl, { headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' } });
-    const data = await res.json().catch(() => ({}));
-    return jsonResponse(data, res.status);
-  }
+  // 5. مسار جلب حسابات الإنستغرام (نسخة آمنة من الردود الفارغة)
+    if (request.method === 'GET' && path === '/api/auth/instagram/accounts') {
+        const tempToken = url.searchParams.get('tempToken');
+        const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${PROFILE_ID}&tempToken=${tempToken}`;
+        
+        try {
+            const res = await fetch(zernioUrl, { 
+                headers: { 
+                    'Authorization': `Bearer ${API_KEY}`,
+                    'Content-Type': 'application/json'
+                } 
+            });
 
-  if (request.method === 'POST' && path === '/api/auth/instagram/select') {
-    const body = await request.json().catch(() => ({}));
-    body.profileId = PROFILE_ID;
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account`;
-    const res = await fetch(zernioUrl, { 
-      method: 'POST', 
-      headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const data = await res.json().catch(() => ({}));
-    return jsonResponse(data, res.status);
-  }
+            // قراءة الرد كنص أولاً لمنع انهيار الـ JSON
+            const text = await res.text();
+            let data = {};
+            try {
+                data = text ? JSON.parse(text) : {};
+            } catch (_) {
+                data = { raw: text };
+            }
+
+            // ضمان إرجاع كود 200 أو الكود الحقيقي مع جسم JSON دائماً
+            return new Response(JSON.stringify(data), { 
+                status: res.status, 
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        } catch (err) {
+            return new Response(JSON.stringify({ error: err.message, pages: [] }), { 
+                status: 500, 
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+    }
 
   return jsonResponse({ error: 'المسار غير موجود' }, 404);
 }
