@@ -1,21 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "zernio-social-inbox-agent",
+  "name": "automation",
   "main": "worker.js",
   "compatibility_date": "2025-06-01",
 
-  // ذاكرة KV لتخزين: الـ System Prompt، مستندات الـ RAG، الإحصائيات، ومنع تكرار الأحداث
   "kv_namespaces": [
     {
       "binding": "ZERNIO_KV",
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
   ]
-
-  // الأسرار والمفاتيح تُضاف عبر الأوامر التالية أو من لوحة تحكم Cloudflare:
-  //   npx wrangler secret put ZERNIO_API_KEY
-  //   npx wrangler secret put ZERNIO_WEBHOOK_SECRET
-  //   npx wrangler secret put GEMINI_API_KEY
-  //   npx wrangler secret put CLOUDFLARE_API_TOKEN
-  //   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
 }
