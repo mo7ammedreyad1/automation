@@ -171,7 +171,7 @@ async function getSystemInstruction(env) {
 
 // استدعاء Google Gemini مع محاولة 3 مرات
 async function callGeminiDirect(geminiKey, promptText, systemInstruction) {
-    const models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"];
+    const models = [gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it"];
     
     for (const model of models) {
         try {
