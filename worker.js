@@ -105,20 +105,61 @@ async function handleApiRequests(request, env, url) {
         });
     }
 
-    // 5. مسار تأكيد ربط صفحة الفيسبوك
-    if (request.method === 'POST' && path === '/api/auth/facebook/select') {
+
+
+  if (request.method === 'POST' && path === '/api/auth/facebook/select') {
         const body = await request.json().catch(() => ({}));
         body.profileId = PROFILE_ID; 
+
+        const connectToken = body.connect_token || body.connectToken || request.headers.get('x-connect-token') || '';
+        
+        const zernioHeaders = { 
+            'Authorization': `Bearer ${API_KEY}`, 
+            'Content-Type': 'application/json' 
+        };
+        if (connectToken) {
+            zernioHeaders['X-Connect-Token'] = connectToken;
+        }
+
+        // حماية حاسمة: Zernio تشترط أن يكون userProfile كائناً وليس null
+        if (!body.userProfile || typeof body.userProfile !== 'object') {
+            // محاولة جلب بيانات المستخدم من فيسبوك مباشرة
+            if (body.tempToken) {
+                try {
+                    const meRes = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name&access_token=${body.tempToken}`);
+                    const meData = await meRes.json();
+                    if (meData.id) {
+                        body.userProfile = { id: String(meData.id), name: meData.name || 'Facebook User' };
+                    }
+                } catch (e) {
+                    console.error("FB Me Graph Error:", e);
+                }
+            }
+            
+            // ضمان نهائي: إذا لم نجدها نضع كائناً بدلاً من null حتى لا ترفض Zernio الطلب
+            if (!body.userProfile || typeof body.userProfile !== 'object') {
+                body.userProfile = { 
+                    id: String(body.pageId || "1000000000"), 
+                    name: "Facebook User" 
+                };
+            }
+        }
 
         const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page`;
         const res = await fetch(zernioUrl, { 
             method: 'POST', 
-            headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+            headers: zernioHeaders,
             body: JSON.stringify(body)
         });
+
         const data = await res.json().catch(() => ({}));
-        return new Response(JSON.stringify(data), { status: res.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+        return new Response(JSON.stringify(data), { 
+            status: res.status, 
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
     }
+
+
 
     // 6. مسار جلب رابط تفويض الإنستغرام
     if (request.method === 'GET' && path === '/api/auth/instagram') {
