@@ -16,7 +16,7 @@ const WORKERS_AI_MODELS = [
   "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it",
 ];
-const DEFAULT_GEMINI_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro"];
+const DEFAULT_GEMINI_MODELS = ["gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it"];
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
