@@ -2,7 +2,11 @@
 // Bedaya Meta Agent Worker (v10.0: Microservice with RAG & Direct Zernio Engine)
 // خادم مخصص لإدارة محادثات إنستغرام وفيسبوك مع نظام RAG لقراءة نصوص الملفات
 // =============================================================================
-
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token',
+};
 // 👇 ضع بيانات حساب Zernio الخاص بهذا العميل/السيرفر هنا مباشرة 👇
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
 const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
@@ -107,10 +111,12 @@ async function handleApiRequests(request, env, url) {
 
 
 
-  if (request.method === 'POST' && path === '/api/auth/facebook/select') {
+  // 3. مسار تأكيد ربط صفحة الفيسبوك
+    if (request.method === 'POST' && path === '/api/auth/facebook/select') {
         const body = await request.json().catch(() => ({}));
         body.profileId = PROFILE_ID; 
 
+        // استخراج connect_token من body أو header
         const connectToken = body.connect_token || body.connectToken || request.headers.get('x-connect-token') || '';
         
         const zernioHeaders = { 
@@ -121,28 +127,17 @@ async function handleApiRequests(request, env, url) {
             zernioHeaders['X-Connect-Token'] = connectToken;
         }
 
-        // حماية حاسمة: Zernio تشترط أن يكون userProfile كائناً وليس null
+        // لو كان userProfile نصاً مشفراً نفكه، أو نضمن عدم إرسال null
+        if (typeof body.userProfile === 'string') {
+            try {
+                let dec = decodeURIComponent(body.userProfile);
+                if (dec.startsWith('%')) dec = decodeURIComponent(dec);
+                body.userProfile = JSON.parse(dec);
+            } catch (_) {}
+        }
+
         if (!body.userProfile || typeof body.userProfile !== 'object') {
-            // محاولة جلب بيانات المستخدم من فيسبوك مباشرة
-            if (body.tempToken) {
-                try {
-                    const meRes = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name&access_token=${body.tempToken}`);
-                    const meData = await meRes.json();
-                    if (meData.id) {
-                        body.userProfile = { id: String(meData.id), name: meData.name || 'Facebook User' };
-                    }
-                } catch (e) {
-                    console.error("FB Me Graph Error:", e);
-                }
-            }
-            
-            // ضمان نهائي: إذا لم نجدها نضع كائناً بدلاً من null حتى لا ترفض Zernio الطلب
-            if (!body.userProfile || typeof body.userProfile !== 'object') {
-                body.userProfile = { 
-                    id: String(body.pageId || "1000000000"), 
-                    name: "Facebook User" 
-                };
-            }
+            body.userProfile = { id: String(body.pageId || "122132545395248368"), name: "Muhammad Reyad" };
         }
 
         const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page`;
@@ -157,7 +152,7 @@ async function handleApiRequests(request, env, url) {
             status: res.status, 
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
-    }
+                                            }
 
 
 
