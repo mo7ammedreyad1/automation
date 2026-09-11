@@ -2,11 +2,7 @@
 // Bedaya Meta Agent Worker (v10.0: Microservice with RAG & Direct Zernio Engine)
 // خادم مخصص لإدارة محادثات إنستغرام وفيسبوك مع نظام RAG لقراءة نصوص الملفات
 // =============================================================================
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token',
-};
+
 // 👇 ضع بيانات حساب Zernio الخاص بهذا العميل/السيرفر هنا مباشرة 👇
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
 const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
@@ -34,7 +30,7 @@ const AUTO_CONTEXT_LIMIT = 20;
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token',
 };
 
 // -----------------------------------------------------------------------------
