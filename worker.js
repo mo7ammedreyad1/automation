@@ -1,4 +1,3 @@
-// =============================================================================
 // Bedaya Meta Direct Engine (v19.0: Gemma-4-26b + Auto-Fallback + Zero-Leak)
 // Worker URL: https://automation.nckalo018.workers.dev
 // =============================================================================
@@ -9,7 +8,7 @@ const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const PRIMARY_MODEL = "gemma-4-26b-a4b-it";
-const FALLBACK_MODEL = "gemini-1.5-flash";
+const FALLBACK_MODEL = "gemini-3.5-flash-lite";
 
 const CALL_TIMEOUT_MS = 15000;
 const AI_TIMEOUT_MS = 25000;
