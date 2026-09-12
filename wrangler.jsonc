@@ -1,14 +1,31 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "automation",
+  "name": "bedaya-enterprise-agent",
   "main": "worker.js",
-  "compatibility_date": "2025-06-01",
-
-
+  "compatibility_date": "2026-03-01",
   "kv_namespaces": [
     {
       "binding": "ZERNIO_KV",
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
-  ]
+  ],
+  "queues": {
+    "producers": [
+      { "queue": "zernio-events", "binding": "EVENTS_QUEUE" }
+    ],
+    "consumers": [
+      {
+        "queue": "zernio-events",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "zernio-events-dlq"
+      },
+      {
+        "queue": "zernio-events-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 30
+      }
+    ]
+  }
 }
