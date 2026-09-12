@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Meta Direct Engine (v15.0: Triple-Shield Character Guard & Isolated OAuth)
+// Bedaya Meta Direct Engine (v17.0: Official Zernio Facebook Connect & Gemma-4-26b)
 // Worker URL: https://automation.nckalo018.workers.dev
 // =============================================================================
 
@@ -11,10 +11,10 @@ const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models
 const TARGET_MODEL = "gemma-4-26b-a4b-it";
 
 const CALL_TIMEOUT_MS = 15000;
-const AI_TIMEOUT_MS = 30000;
+const AI_TIMEOUT_MS = 25000;
 const AUDIT_LOG_TTL_SECONDS = 3 * 24 * 60 * 60; // 3 أيام
 const DEDUP_TTL_SECONDS = 86400; // 24 ساعة
-const MAX_SAFE_CHARS = 850; // أقصى حد آمن لمنع خطأ الـ 1,000 حرف من Meta
+const MAX_SAFE_CHARS = 600; // حد أمان قاطع ضد خطأ الـ 1000 حرف
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -31,21 +31,32 @@ function jsonResponse(data, status = 200) {
 
 function isoNow() { return new Date().toISOString(); }
 
-// تنظيف وقص الرد ليطابق قيود Meta الصارمة (< 1,000 حرف)
-function sanitizeAndTrimReply(text, maxChars = MAX_SAFE_CHARS) {
-  if (!text) return "";
-  let cleaned = String(text).trim();
-  // حذف أي وسوم تفكير داخلية
+// -----------------------------------------------------------------------------
+// تنظيف الرد: إزالة وسوم التفكير وتسريب البرومبت
+// -----------------------------------------------------------------------------
+function sanitizeAiResponse(rawText) {
+  if (!rawText) return '';
+  let cleaned = String(rawText).trim();
+
+  // 1. حذف وسوم التفكير
   cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  cleaned = cleaned.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
   cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/gi, '$1').trim();
-  
-  if (cleaned.length > maxChars) {
-    cleaned = cleaned.slice(0, maxChars);
+
+  // 2. حذف تكرار عناوين التعليمات والبرومبت
+  cleaned = cleaned.replace(/===.*?===/gi, '').trim();
+  cleaned = cleaned.replace(/تعليمات وشخصية المتجر.*?:/gi, '').trim();
+  cleaned = cleaned.replace(/قواعد صارمة.*?:/gi, '').trim();
+
+  // 3. القص الصارم عند 600 حرف كحد أقصى
+  if (cleaned.length > MAX_SAFE_CHARS) {
+    cleaned = cleaned.slice(0, MAX_SAFE_CHARS);
     const lastSpace = cleaned.lastIndexOf(' ');
-    if (lastSpace > maxChars - 60) cleaned = cleaned.slice(0, lastSpace);
+    if (lastSpace > MAX_SAFE_CHARS - 50) cleaned = cleaned.slice(0, lastSpace);
     cleaned += '...';
   }
-  return cleaned;
+
+  return cleaned.trim();
 }
 
 // -----------------------------------------------------------------------------
@@ -175,16 +186,13 @@ async function pushToFailedQueue(env, item) {
     createdAt: item.createdAt || isoNow()
   };
 
-  if (idx >= 0) {
-    queue[idx] = entry;
-  } else {
-    queue.push(entry);
-  }
+  if (idx >= 0) queue[idx] = entry;
+  else queue.push(entry);
   await saveFailedQueue(env, queue);
 }
 
 // -----------------------------------------------------------------------------
-// 4) توليد الرد الصارم مع قفل الحجم (< 500 حرف)
+// 4) توليد الرد الصارم مع قفل الحجم التام ومنع تسريب التعليمات
 // -----------------------------------------------------------------------------
 async function generateStrictReply(env, incomingText, contextHistory = '', isComment = false, auditLogId = null) {
   let customPrompt = 'أنت مساعد خدمة عملاء ومبيعات محترف وودود، ترد باختصار ولباقة ودقة على استفسارات العملاء.';
@@ -196,13 +204,16 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
   }
 
   const systemInstruction = [
-    '=== تعليمات وشخصية المتجر ===',
+    '=== معلومات المتجر وقاعدة المعرفة (RAG) ===',
+    ragContent ? ragContent : 'لا توجد معلومات إضافية.',
+    '',
+    '=== تعليمات وشخصية الرد ===',
     customPrompt,
-    ragContent ? `\n=== قاعدة المعرفة والمنتجات (RAG) ===\n${ragContent}` : '',
-    '\n=== القواعد الصارمة لحجم النص (Meta 1000 Chars Limit) ===',
-    '1. الحد الأقصى المطلق لطول إجابتك بالكامل هو 450 حرفاً فقط.',
-    '2. ممنوع منعاً باتاً كتابة أي نصوص تفكير أو تحليلات، اكتب الرد المباشر والنهائي للعميل فقط باللغة العربية.',
-    isComment ? '3. هذا رد على تعليق: اجعله جذاباً وموجزاً.' : '3. هذه محادثة خاصة (DM): أجب العميل مباشرة وقدم له المعلومة باختصار واحترافية.'
+    '',
+    '=== قواعد صارمة وحاسمة لمنع الأخطاء ===',
+    '1. اكتب نص الإجابة المباشرة والنهائية للعميل فقط باللغة العربية.',
+    '2. ممنوع منعاً باتاً كتابة أي وسوم تفكير أو تكرار التعليمات أو البرومبت في الرد.',
+    '3. الحد الأقصى المطلق لطول ردك هو 300 حرف فقط.'
   ].join('\n');
 
   const geminiKey = (env.GEMINI_API_KEY || '').split(',')[0].trim();
@@ -226,35 +237,37 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
           ],
           systemInstruction: { parts: [{ text: systemInstruction }] },
           generationConfig: {
-            temperature: 0.35,
-            maxOutputTokens: 300 // قفل فيزيائي لحجم النص
+            temperature: 0.25,
+            maxOutputTokens: 200 // قفل فيزيائي لحجم النص
           }
         })
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('AI Request Timeout')), AI_TIMEOUT_MS))
+      new Promise((_, reject) => setTimeout(() => reject(new Error('AI Timeout')), AI_TIMEOUT_MS))
     ]);
 
     if (res.ok) {
       const data = await res.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text && text.trim()) {
-        const cleanReply = sanitizeAndTrimReply(text);
-        if (auditLogId) await updateAuditLog(env, auditLogId, { workflowStep: { step: 'ai_generated', model: TARGET_MODEL, chars: cleanReply.length, status: 'ok' } });
-        return cleanReply;
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (rawText && rawText.trim()) {
+        const cleanReply = sanitizeAiResponse(rawText);
+        if (cleanReply) {
+          if (auditLogId) await updateAuditLog(env, auditLogId, { workflowStep: { step: 'ai_generated', model: TARGET_MODEL, chars: cleanReply.length, status: 'ok' } });
+          return cleanReply;
+        }
       }
     } else {
       const errText = await res.text();
-      console.error(`Gemini API Error:`, res.status, errText);
+      console.error('Gemini API Error:', res.status, errText);
     }
   } catch (err) {
-    console.error(`AI generation error:`, err);
+    console.error('AI generate error:', err);
   }
 
   return null;
 }
 
 // -----------------------------------------------------------------------------
-// 5) معالجة الـ DMs والتعليقات
+// 5) معالجة الرسائل والتعليقات
 // -----------------------------------------------------------------------------
 async function handleDirectMessage(env, payload, preGeneratedReply = null) {
   const accountId = payload.account?.id || payload.account?.accountId;
@@ -314,7 +327,7 @@ async function handleDirectMessage(env, payload, preGeneratedReply = null) {
     return;
   }
 
-  aiReplyText = sanitizeAndTrimReply(aiReplyText);
+  aiReplyText = sanitizeAiResponse(aiReplyText);
 
   const sendRes = await zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages`, {
     method: 'POST',
@@ -327,7 +340,6 @@ async function handleDirectMessage(env, payload, preGeneratedReply = null) {
       replyText: aiReplyText,
       workflowStep: { step: 'delivered_to_platform', status: 'success', zernioStatus: sendRes.status }
     });
-    // إزالة من طابور الفشل إن وجد
     const queue = (await getFailedQueue(env)).filter(q => q.id !== messageId);
     await saveFailedQueue(env, queue);
   } else {
@@ -375,7 +387,7 @@ async function handleDirectComment(env, payload, preGeneratedReply = null) {
     return;
   }
 
-  aiReplyText = sanitizeAndTrimReply(aiReplyText);
+  aiReplyText = sanitizeAiResponse(aiReplyText);
 
   const replyRes = await zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}`, {
     method: 'POST',
@@ -424,7 +436,7 @@ async function retryAllFailedMessages(env) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) مسارات الـ API الشاملة
+// 6) مسارات الـ API المطابقة لتوثيق Zernio الرسمي
 // -----------------------------------------------------------------------------
 async function handleApiRequests(request, env, url) {
   const path = url.pathname;
@@ -432,7 +444,7 @@ async function handleApiRequests(request, env, url) {
   const API_KEY = (WORKER_ZERNIO_API_KEY || env.ZERNIO_API_KEY || '').trim();
   const PROFILE_ID = (WORKER_ZERNIO_PROFILE_ID || env.ZERNIO_PROFILE_ID || '').trim();
 
-  // 1. مسار إحصائيات Zernio الرسمية
+  // 1. إحصائيات Zernio الرسمية
   if (method === 'GET' && path === '/api/analytics') {
     const today = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -448,13 +460,13 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 2. مسار جلب الحسابات المتصلة بـ Zernio
+  // 2. الحسابات المتصلة
   if (method === 'GET' && path === '/api/accounts') {
     const zernioRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 3. مسار فصل الحساب
+  // 3. فصل الحساب
   if (method === 'DELETE' && path.startsWith('/api/accounts/')) {
     const accountId = path.split('/api/accounts/')[1];
     if (!accountId) return jsonResponse({ error: 'accountId مطلوب' }, 400);
@@ -469,7 +481,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. سجل تدفق الرسائل لـ 3 أيام
+  // 4. سجل الـ 3 أيام
   if (method === 'GET' && path === '/api/audit-logs') {
     const logs = await getRecentAuditLogs(env);
     return jsonResponse({ ok: true, count: logs.length, logs });
@@ -496,7 +508,7 @@ async function handleApiRequests(request, env, url) {
     });
   }
 
-  // 6. طابور الفشل وإعادة الإرسال
+  // 6. طابور الفشل
   if (method === 'GET' && path === '/api/failed-messages') {
     const queue = await getFailedQueue(env);
     return jsonResponse({ ok: true, count: queue.length, queue });
@@ -540,7 +552,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح قاعدة المعرفة بنجاح' });
   }
 
-  // 8. مسارات OAuth فيسبوك (مفصولة بالكامل)
+  // 8. مسارات OAuth فيسبوك (وفق توثيق Zernio الرسمي بالضبط) ⭐
   if (method === 'GET' && path === '/api/auth/facebook') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -548,14 +560,21 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
+  // جلب صفحات فيسبوك الرسمية من Zernio
   if (method === 'GET' && path === '/api/auth/facebook/pages') {
     const tempToken = url.searchParams.get('tempToken');
+    const connectToken = url.searchParams.get('connect_token') || request.headers.get('x-connect-token') || '';
     if (!tempToken) return jsonResponse({ error: 'tempToken مطلوب' }, 400);
-    const graphRes = await fetch(`https://graph.facebook.com/v19.0/me/accounts?access_token=${tempToken}`);
-    const data = await graphRes.json().catch(() => ({}));
-    return jsonResponse(data, graphRes.status);
+
+    const headers = { 'Authorization': `Bearer ${API_KEY}` };
+    if (connectToken) headers['X-Connect-Token'] = connectToken;
+
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page?profileId=${PROFILE_ID}&tempToken=${encodeURIComponent(tempToken)}`;
+    const res = await fetch(zernioUrl, { headers });
+    return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
+  // تأكيد ربط صفحة فيسبوك في Zernio
   if (method === 'POST' && path === '/api/auth/facebook/select') {
     const body = await request.json().catch(() => ({}));
     body.profileId = PROFILE_ID;
@@ -571,7 +590,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 9. مسارات OAuth إنستغرام (مفصولة بالكامل)
+  // 9. مسارات OAuth إنستغرام (وفق توثيق Zernio الرسمي) ⭐
   if (method === 'GET' && path === '/api/auth/instagram') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
@@ -598,7 +617,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 10. تجربة الشات المباشر مع فحص الحجم
+  // 10. اختبار الشات وفحص عدد الحروف
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار؟';
@@ -644,6 +663,6 @@ export default {
       return jsonResponse({ ok: true, queued: true });
     }
 
-    return new Response('Bedaya Production Engine v15.0 Running (Character Shield & Isolated OAuth).', { headers: corsHeaders });
+    return new Response('Bedaya Production Engine v17.0 Running (Official Zernio Facebook Connect).', { headers: corsHeaders });
   }
 };
