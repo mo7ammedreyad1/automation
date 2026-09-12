@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Meta Direct Engine (v18.0: Zero-Thinking Filter & Full Zernio Compliance)
+// Bedaya Meta Direct Engine (v19.0: Gemma-4-26b + Auto-Fallback + Zero-Leak)
 // Worker URL: https://automation.nckalo018.workers.dev
 // =============================================================================
 
@@ -8,13 +8,14 @@ const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
-const TARGET_MODEL = "gemma-4-26b-a4b-it";
+const PRIMARY_MODEL = "gemma-4-26b-a4b-it";
+const FALLBACK_MODEL = "gemini-1.5-flash";
 
 const CALL_TIMEOUT_MS = 15000;
 const AI_TIMEOUT_MS = 25000;
 const AUDIT_LOG_TTL_SECONDS = 3 * 24 * 60 * 60; // 3 أيام
 const DEDUP_TTL_SECONDS = 86400; // 24 ساعة
-const MAX_SAFE_CHARS = 550; // حد أمان قاطع ضد خطأ الـ 1000 حرف
+const MAX_SAFE_CHARS = 450; // حد أمان قاطع ضد خطأ الـ 1000 حرف
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -32,24 +33,27 @@ function jsonResponse(data, status = 200) {
 function isoNow() { return new Date().toISOString(); }
 
 // -----------------------------------------------------------------------------
-// تنظيف الرد: إزالة التفكير وتسريب التعليمات وقص النص بذكاء
+// تنظيف الرد: إزالة التفكير وتسريب البرومبت والـ RAG
 // -----------------------------------------------------------------------------
 function sanitizeAiResponse(rawText) {
   if (!rawText) return '';
   let cleaned = String(rawText).trim();
 
-  // 1. حذف وسوم التفكير إن وجدت
+  // 1. حذف وسوم التفكير
   cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   cleaned = cleaned.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
   cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/gi, '$1').trim();
 
-  // 2. حذف تكرار عناوين التعليمات والبرومبت
-  cleaned = cleaned.replace(/===.*?===/gi, '').trim();
-  cleaned = cleaned.replace(/معلومات المتجر.*?:/gi, '').trim();
-  cleaned = cleaned.replace(/تعليمات وشخصية الرد.*?:/gi, '').trim();
-  cleaned = cleaned.replace(/قواعد صارمة.*?:/gi, '').trim();
+  // 2. حذف أي تكرار لعناوين البرومبت والـ RAG
+  cleaned = cleaned.replace(/===[\s\S]*?===/gi, '').trim();
+  cleaned = cleaned.replace(/\[تعليمات[\s\S]*?\]/gi, '').trim();
+  cleaned = cleaned.replace(/\[قاعدة المعرفة[\s\S]*?\]/gi, '').trim();
+  cleaned = cleaned.replace(/^.*?(?:التعليمات|معلومات المتجر|قاعدة المعرفة|الرد المطلوب|رسالة العميل)\s*:.*$/gim, '').trim();
 
-  // 3. القص الصارم عند 550 حرفاً كأقصى حد آمن لـ Meta
+  // 3. تنظيف الفراغات المتكررة
+  cleaned = cleaned.replace(/\n{2,}/g, '\n').trim();
+
+  // 4. القص الصارم عند 450 حرفاً كحد أقصى آمن
   if (cleaned.length > MAX_SAFE_CHARS) {
     cleaned = cleaned.slice(0, MAX_SAFE_CHARS);
     const lastSpace = cleaned.lastIndexOf(' ');
@@ -84,7 +88,7 @@ async function zernioFetch(env, path, options = {}) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) سجل تتبع الـ 3 أيام
+// 2) سجل تتبع تدفق الرسائل لـ 3 أيام
 // -----------------------------------------------------------------------------
 async function createAuditLog(env, logEntry) {
   if (!env.ZERNIO_KV) return;
@@ -193,8 +197,53 @@ async function pushToFailedQueue(env, item) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) توليد الرد الصارم مع تعطيل التفكير (thinkingBudget: 0) وتصفية الـ Parts
+// 4) توليد الرد الصارم مع تعطيل التفكير والـ Fallback التلقائي
 // -----------------------------------------------------------------------------
+async function callGeminiModel(modelName, geminiKey, fullPrompt) {
+  const url = `${GEMINI_API_BASE}/${modelName}:generateContent?key=${geminiKey}`;
+  const res = await Promise.race([
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: fullPrompt }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.25,
+          maxOutputTokens: 250,
+          thinkingConfig: {
+            thinkingLevel: "OFF",
+            thinkingBudget: 0
+          }
+        }
+      })
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('AI Request Timeout')), AI_TIMEOUT_MS))
+  ]);
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  const parts = data.candidates?.[0]?.content?.parts || [];
+  const textParts = parts.filter(p => !p.thought && p.text);
+
+  let raw = '';
+  if (textParts.length > 0) {
+    raw = textParts.map(p => p.text).join('\n');
+  } else if (parts.length > 0) {
+    raw = parts[parts.length - 1].text || '';
+  }
+
+  return raw;
+}
+
 async function generateStrictReply(env, incomingText, contextHistory = '', isComment = false, auditLogId = null) {
   let customPrompt = 'أنت مساعد خدمة عملاء ومبيعات محترف وودود، ترد باختصار ولباقة ودقة على استفسارات العملاء.';
   let ragContent = '';
@@ -204,17 +253,19 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
     ragContent = await env.ZERNIO_KV.get('rag_doc_content') || '';
   }
 
-  const systemInstruction = [
-    '=== معلومات المتجر وقاعدة المعرفة (RAG) ===',
-    ragContent ? ragContent : 'لا توجد معلومات إضافية.',
-    '',
-    '=== تعليمات وشخصية الرد ===',
+  // بناء المدخلات بدون استخدام حقل systemInstruction لتفادي تكراره في Gemma
+  const fullPrompt = [
+    `[تعليمات المتجر]`,
     customPrompt,
-    '',
-    '=== قواعد صارمة جداً لمنع الأخطاء ===',
-    '1. اكتب نص الإجابة المباشرة والنهائية الموجهة للعميل فقط باللغة العربية.',
-    '2. ممنوع منعاً باتاً تكرار أي جزء من التعليمات أو إظهار أفكارك أو وسوم التفكير.',
-    '3. أقصى حد مسموح به لطول الإجابة هو 300 حرف فقط.'
+    ragContent ? `\n[قاعدة المعرفة والمنتجات RAG]\n${ragContent}` : '',
+    contextHistory ? `\n[سياق المحادثة السابقة]\n${contextHistory}` : '',
+    `\n[رسالة العميل الحالية]`,
+    incomingText,
+    `\n[قواعد الرد الإلزامية]`,
+    `1. اكتب نص الرد النهائي المباشر للعميل فقط باللغة العربية.`,
+    `2. ممنوع منعاً باتاً تكرار أي سطر من التعليمات أو قاعدة المعرفة أو كتابة أي تفكير داخلي.`,
+    `3. أقصى حد لطول الرد هو 250 حرف فقط.`,
+    `الرد المباشر الصافي:`
   ].join('\n');
 
   const geminiKey = (env.GEMINI_API_KEY || '').split(',')[0].trim();
@@ -223,65 +274,35 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
     return null;
   }
 
-  try {
-    const res = await Promise.race([
-      fetch(`${GEMINI_API_BASE}/${TARGET_MODEL}:generateContent`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': geminiKey
-        },
-        body: JSON.stringify({
-          contents: [
-            ...(contextHistory ? [{ role: 'user', parts: [{ text: `سياق المحادثة:\n${contextHistory}` }] }] : []),
-            { role: 'user', parts: [{ text: incomingText }] }
-          ],
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 200,
-            thinkingConfig: {
-              thinkingBudget: 0 // تعطيل وضع التفكير تماماً برمجياً
-            }
-          }
-        })
-      }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('AI Timeout')), AI_TIMEOUT_MS))
-    ]);
+  const modelsToTry = [PRIMARY_MODEL, FALLBACK_MODEL];
+  let lastError = '';
 
-    if (res.ok) {
-      const data = await res.json();
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      
-      // استخراج الأجزاء غير المخصصة للتفكير فقط
-      const nonThoughtParts = parts.filter(p => !p.thought && p.text);
-      let rawText = '';
-      if (nonThoughtParts.length > 0) {
-        rawText = nonThoughtParts.map(p => p.text).join('\n');
-      } else if (parts.length > 0) {
-        rawText = parts[parts.length - 1].text || '';
-      }
-
+  for (const model of modelsToTry) {
+    try {
+      const rawText = await callGeminiModel(model, geminiKey, fullPrompt);
       if (rawText && rawText.trim()) {
         const cleanReply = sanitizeAiResponse(rawText);
         if (cleanReply) {
-          if (auditLogId) await updateAuditLog(env, auditLogId, { workflowStep: { step: 'ai_generated', model: TARGET_MODEL, chars: cleanReply.length, status: 'ok' } });
-          return cleanReply;
+          if (auditLogId) {
+            await updateAuditLog(env, auditLogId, {
+              workflowStep: { step: 'ai_generated', model, chars: cleanReply.length, status: 'ok' }
+            });
+          }
+          return { reply: cleanReply, model };
         }
       }
-    } else {
-      const errText = await res.text();
-      console.error('Gemini API Error:', res.status, errText);
+    } catch (err) {
+      lastError = err.message;
+      console.warn(`Model ${model} failed, trying next...`, err.message);
     }
-  } catch (err) {
-    console.error('AI generate error:', err);
   }
 
+  console.error('All AI models failed:', lastError);
   return null;
 }
 
 // -----------------------------------------------------------------------------
-// 5) معالجة الرسائل والتعليقات
+// 5) معالجات الرسائل والتعليقات
 // -----------------------------------------------------------------------------
 async function handleDirectMessage(env, payload, preGeneratedReply = null) {
   const accountId = payload.account?.id || payload.account?.accountId;
@@ -320,8 +341,8 @@ async function handleDirectMessage(env, payload, preGeneratedReply = null) {
     body: JSON.stringify({ accountId })
   }).catch(() => {});
 
-  let aiReplyText = preGeneratedReply;
-  if (!aiReplyText) {
+  let aiResult = preGeneratedReply ? { reply: preGeneratedReply, model: 'manual_retry' } : null;
+  if (!aiResult) {
     let contextHistory = '';
     try {
       const history = await zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages?accountId=${accountId}&limit=5&sortOrder=desc`);
@@ -331,35 +352,35 @@ async function handleDirectMessage(env, payload, preGeneratedReply = null) {
       }
     } catch (_) {}
 
-    aiReplyText = await generateStrictReply(env, incomingText, contextHistory, false, messageId);
+    aiResult = await generateStrictReply(env, incomingText, contextHistory, false, messageId);
   }
 
-  if (!aiReplyText) {
-    const errorMsg = `فشل توليد الرد من موديل (${TARGET_MODEL})`;
+  if (!aiResult || !aiResult.reply) {
+    const errorMsg = `فشل توليد الرد من الذكاء الاصطناعي`;
     await updateAuditLog(env, messageId, { status: 'failed', error: errorMsg });
     await pushToFailedQueue(env, { id: messageId, type: 'message', platform, payload, errorReason: errorMsg });
     return;
   }
 
-  aiReplyText = sanitizeAiResponse(aiReplyText);
+  const finalReply = sanitizeAiResponse(aiResult.reply);
 
   const sendRes = await zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages`, {
     method: 'POST',
-    body: JSON.stringify({ accountId, message: aiReplyText })
+    body: JSON.stringify({ accountId, message: finalReply })
   });
 
   if (sendRes.ok) {
     await updateAuditLog(env, messageId, {
       status: 'completed',
-      replyText: aiReplyText,
-      workflowStep: { step: 'delivered_to_platform', status: 'success', zernioStatus: sendRes.status }
+      replyText: finalReply,
+      workflowStep: { step: 'delivered_to_platform', status: 'success', model: aiResult.model, zernioStatus: sendRes.status }
     });
     const queue = (await getFailedQueue(env)).filter(q => q.id !== messageId);
     await saveFailedQueue(env, queue);
   } else {
     const errorMsg = `فشل الإرسال لـ Zernio (${sendRes.status}): ${JSON.stringify(sendRes.data)}`;
-    await updateAuditLog(env, messageId, { status: 'queued_for_retry', error: errorMsg, replyText: aiReplyText });
-    await pushToFailedQueue(env, { id: messageId, type: 'message', platform, payload, generatedReply: aiReplyText, errorReason: errorMsg });
+    await updateAuditLog(env, messageId, { status: 'queued_for_retry', error: errorMsg, replyText: finalReply });
+    await pushToFailedQueue(env, { id: messageId, type: 'message', platform, payload, generatedReply: finalReply, errorReason: errorMsg });
   }
 }
 
@@ -389,37 +410,37 @@ async function handleDirectComment(env, payload, preGeneratedReply = null) {
 
   await createAuditLog(env, logEntry);
 
-  let aiReplyText = preGeneratedReply;
-  if (!aiReplyText) {
-    aiReplyText = await generateStrictReply(env, commentText, '', true, commentId);
+  let aiResult = preGeneratedReply ? { reply: preGeneratedReply, model: 'manual_retry' } : null;
+  if (!aiResult) {
+    aiResult = await generateStrictReply(env, commentText, '', true, commentId);
   }
 
-  if (!aiReplyText) {
+  if (!aiResult || !aiResult.reply) {
     const errorMsg = `فشل توليد رد التعليق من الذكاء الاصطناعي`;
     await updateAuditLog(env, commentId, { status: 'failed', error: errorMsg });
     await pushToFailedQueue(env, { id: commentId, type: 'comment', platform, payload, errorReason: errorMsg });
     return;
   }
 
-  aiReplyText = sanitizeAiResponse(aiReplyText);
+  const finalReply = sanitizeAiResponse(aiResult.reply);
 
   const replyRes = await zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}`, {
     method: 'POST',
-    body: JSON.stringify({ accountId, commentId, message: aiReplyText })
+    body: JSON.stringify({ accountId, commentId, message: finalReply })
   });
 
   if (replyRes.ok) {
     await updateAuditLog(env, commentId, {
       status: 'completed',
-      replyText: aiReplyText,
-      workflowStep: { step: 'comment_replied', status: 'success', zernioStatus: replyRes.status }
+      replyText: finalReply,
+      workflowStep: { step: 'comment_replied', status: 'success', model: aiResult.model, zernioStatus: replyRes.status }
     });
     const queue = (await getFailedQueue(env)).filter(q => q.id !== commentId);
     await saveFailedQueue(env, queue);
   } else {
     const errorMsg = `فشل إرسال التعليق لـ Zernio (${replyRes.status}): ${JSON.stringify(replyRes.data)}`;
-    await updateAuditLog(env, commentId, { status: 'queued_for_retry', error: errorMsg, replyText: aiReplyText });
-    await pushToFailedQueue(env, { id: commentId, type: 'comment', platform, payload, generatedReply: aiReplyText, errorReason: errorMsg });
+    await updateAuditLog(env, commentId, { status: 'queued_for_retry', error: errorMsg, replyText: finalReply });
+    await pushToFailedQueue(env, { id: commentId, type: 'comment', platform, payload, generatedReply: finalReply, errorReason: errorMsg });
   }
 }
 
@@ -450,7 +471,7 @@ async function retryAllFailedMessages(env) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) مسارات الـ API المطابقة لتوثيق Zernio الرسمي
+// 6) مسارات الـ API
 // -----------------------------------------------------------------------------
 async function handleApiRequests(request, env, url) {
   const path = url.pathname;
@@ -501,7 +522,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, count: logs.length, logs });
   }
 
-  // 5. لوحة فحص الأدمن
+  // 5. نظرة عامة للأدمن
   if (method === 'GET' && path === '/api/admin/overview') {
     const prompt = env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null;
     const ragMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_meta') : null;
@@ -510,7 +531,8 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      activeModel: TARGET_MODEL,
+      activeModel: PRIMARY_MODEL,
+      fallbackModel: FALLBACK_MODEL,
       maxSafeChars: MAX_SAFE_CHARS,
       prompt: prompt || 'البرومبت الافتراضي نشط',
       rag: {
@@ -538,7 +560,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم تفريغ طابور الفشل بنجاح' });
   }
 
-  // 7. إدارة البرومبت والـ RAG
+  // 7. البرومبت والـ RAG
   if (method === 'POST' && path === '/api/set-prompt') {
     const body = await request.json().catch(() => ({}));
     if (!body.prompt) return jsonResponse({ error: 'حقل prompt مفقود' }, 400);
@@ -629,18 +651,20 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 10. اختبار الشات
+  // 10. اختبار الشات الصارم
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار؟';
-    const reply = await generateStrictReply(env, userMessage, '', false, `test_${Date.now()}`);
-    if (!reply) return jsonResponse({ ok: false, error: `تعذر توليد الرد من موديل (${TARGET_MODEL})` }, 500);
+    const result = await generateStrictReply(env, userMessage, '', false, `test_${Date.now()}`);
+    if (!result || !result.reply) {
+      return jsonResponse({ ok: false, error: 'تعذر توليد الرد من الذكاء الاصطناعي' }, 500);
+    }
     return jsonResponse({
       ok: true,
-      model: TARGET_MODEL,
-      charsCount: reply.length,
+      modelUsed: result.model,
+      charsCount: result.reply.length,
       userMessage,
-      reply,
+      reply: result.reply,
       timestamp: isoNow()
     });
   }
@@ -675,6 +699,6 @@ export default {
       return jsonResponse({ ok: true, queued: true });
     }
 
-    return new Response('Bedaya Production Engine v18.0 Running (Zero-Thinking Filter & Zernio Compliance).', { headers: corsHeaders });
+    return new Response('Bedaya Production Engine v19.0 Running (Clean Prompt Injection & Fallback).', { headers: corsHeaders });
   }
 };
