@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Meta Direct Engine (v17.0: Official Zernio Facebook Connect & Gemma-4-26b)
+// Bedaya Meta Direct Engine (v18.0: Zero-Thinking Filter & Full Zernio Compliance)
 // Worker URL: https://automation.nckalo018.workers.dev
 // =============================================================================
 
@@ -14,7 +14,7 @@ const CALL_TIMEOUT_MS = 15000;
 const AI_TIMEOUT_MS = 25000;
 const AUDIT_LOG_TTL_SECONDS = 3 * 24 * 60 * 60; // 3 أيام
 const DEDUP_TTL_SECONDS = 86400; // 24 ساعة
-const MAX_SAFE_CHARS = 600; // حد أمان قاطع ضد خطأ الـ 1000 حرف
+const MAX_SAFE_CHARS = 550; // حد أمان قاطع ضد خطأ الـ 1000 حرف
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -32,23 +32,24 @@ function jsonResponse(data, status = 200) {
 function isoNow() { return new Date().toISOString(); }
 
 // -----------------------------------------------------------------------------
-// تنظيف الرد: إزالة وسوم التفكير وتسريب البرومبت
+// تنظيف الرد: إزالة التفكير وتسريب التعليمات وقص النص بذكاء
 // -----------------------------------------------------------------------------
 function sanitizeAiResponse(rawText) {
   if (!rawText) return '';
   let cleaned = String(rawText).trim();
 
-  // 1. حذف وسوم التفكير
+  // 1. حذف وسوم التفكير إن وجدت
   cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   cleaned = cleaned.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
   cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/gi, '$1').trim();
 
   // 2. حذف تكرار عناوين التعليمات والبرومبت
   cleaned = cleaned.replace(/===.*?===/gi, '').trim();
-  cleaned = cleaned.replace(/تعليمات وشخصية المتجر.*?:/gi, '').trim();
+  cleaned = cleaned.replace(/معلومات المتجر.*?:/gi, '').trim();
+  cleaned = cleaned.replace(/تعليمات وشخصية الرد.*?:/gi, '').trim();
   cleaned = cleaned.replace(/قواعد صارمة.*?:/gi, '').trim();
 
-  // 3. القص الصارم عند 600 حرف كحد أقصى
+  // 3. القص الصارم عند 550 حرفاً كأقصى حد آمن لـ Meta
   if (cleaned.length > MAX_SAFE_CHARS) {
     cleaned = cleaned.slice(0, MAX_SAFE_CHARS);
     const lastSpace = cleaned.lastIndexOf(' ');
@@ -192,7 +193,7 @@ async function pushToFailedQueue(env, item) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) توليد الرد الصارم مع قفل الحجم التام ومنع تسريب التعليمات
+// 4) توليد الرد الصارم مع تعطيل التفكير (thinkingBudget: 0) وتصفية الـ Parts
 // -----------------------------------------------------------------------------
 async function generateStrictReply(env, incomingText, contextHistory = '', isComment = false, auditLogId = null) {
   let customPrompt = 'أنت مساعد خدمة عملاء ومبيعات محترف وودود، ترد باختصار ولباقة ودقة على استفسارات العملاء.';
@@ -210,15 +211,15 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
     '=== تعليمات وشخصية الرد ===',
     customPrompt,
     '',
-    '=== قواعد صارمة وحاسمة لمنع الأخطاء ===',
-    '1. اكتب نص الإجابة المباشرة والنهائية للعميل فقط باللغة العربية.',
-    '2. ممنوع منعاً باتاً كتابة أي وسوم تفكير أو تكرار التعليمات أو البرومبت في الرد.',
-    '3. الحد الأقصى المطلق لطول ردك هو 300 حرف فقط.'
+    '=== قواعد صارمة جداً لمنع الأخطاء ===',
+    '1. اكتب نص الإجابة المباشرة والنهائية الموجهة للعميل فقط باللغة العربية.',
+    '2. ممنوع منعاً باتاً تكرار أي جزء من التعليمات أو إظهار أفكارك أو وسوم التفكير.',
+    '3. أقصى حد مسموح به لطول الإجابة هو 300 حرف فقط.'
   ].join('\n');
 
   const geminiKey = (env.GEMINI_API_KEY || '').split(',')[0].trim();
   if (!geminiKey) {
-    console.error('GEMINI_API_KEY مفقود بالسيرفر');
+    console.error('GEMINI_API_KEY مفقود');
     return null;
   }
 
@@ -237,8 +238,11 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
           ],
           systemInstruction: { parts: [{ text: systemInstruction }] },
           generationConfig: {
-            temperature: 0.25,
-            maxOutputTokens: 200 // قفل فيزيائي لحجم النص
+            temperature: 0.2,
+            maxOutputTokens: 200,
+            thinkingConfig: {
+              thinkingBudget: 0 // تعطيل وضع التفكير تماماً برمجياً
+            }
           }
         })
       }),
@@ -247,7 +251,17 @@ async function generateStrictReply(env, incomingText, contextHistory = '', isCom
 
     if (res.ok) {
       const data = await res.json();
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      
+      // استخراج الأجزاء غير المخصصة للتفكير فقط
+      const nonThoughtParts = parts.filter(p => !p.thought && p.text);
+      let rawText = '';
+      if (nonThoughtParts.length > 0) {
+        rawText = nonThoughtParts.map(p => p.text).join('\n');
+      } else if (parts.length > 0) {
+        rawText = parts[parts.length - 1].text || '';
+      }
+
       if (rawText && rawText.trim()) {
         const cleanReply = sanitizeAiResponse(rawText);
         if (cleanReply) {
@@ -321,7 +335,7 @@ async function handleDirectMessage(env, payload, preGeneratedReply = null) {
   }
 
   if (!aiReplyText) {
-    const errorMsg = `فشل توليد الرد من الذكاء الاصطناعي (${TARGET_MODEL})`;
+    const errorMsg = `فشل توليد الرد من موديل (${TARGET_MODEL})`;
     await updateAuditLog(env, messageId, { status: 'failed', error: errorMsg });
     await pushToFailedQueue(env, { id: messageId, type: 'message', platform, payload, errorReason: errorMsg });
     return;
@@ -552,7 +566,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح قاعدة المعرفة بنجاح' });
   }
 
-  // 8. مسارات OAuth فيسبوك (وفق توثيق Zernio الرسمي بالضبط) ⭐
+  // 8. مسارات OAuth فيسبوك الرسمية
   if (method === 'GET' && path === '/api/auth/facebook') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -560,7 +574,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // جلب صفحات فيسبوك الرسمية من Zernio
   if (method === 'GET' && path === '/api/auth/facebook/pages') {
     const tempToken = url.searchParams.get('tempToken');
     const connectToken = url.searchParams.get('connect_token') || request.headers.get('x-connect-token') || '';
@@ -574,7 +587,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // تأكيد ربط صفحة فيسبوك في Zernio
   if (method === 'POST' && path === '/api/auth/facebook/select') {
     const body = await request.json().catch(() => ({}));
     body.profileId = PROFILE_ID;
@@ -590,7 +602,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 9. مسارات OAuth إنستغرام (وفق توثيق Zernio الرسمي) ⭐
+  // 9. مسارات OAuth إنستغرام الرسمية
   if (method === 'GET' && path === '/api/auth/instagram') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
@@ -617,7 +629,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 10. اختبار الشات وفحص عدد الحروف
+  // 10. اختبار الشات
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار؟';
@@ -663,6 +675,6 @@ export default {
       return jsonResponse({ ok: true, queued: true });
     }
 
-    return new Response('Bedaya Production Engine v17.0 Running (Official Zernio Facebook Connect).', { headers: corsHeaders });
+    return new Response('Bedaya Production Engine v18.0 Running (Zero-Thinking Filter & Zernio Compliance).', { headers: corsHeaders });
   }
 };
