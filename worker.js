@@ -1,6 +1,23 @@
 // =============================================================================
-// Zernio Social Inbox Agent — Cloudflare Worker (v8: DLQ consumer + backoff)
+// Zernio Social Inbox Agent — Cloudflare Worker (v9: نشاط تجاري + سياق ديناميكي)
 // =============================================================================
+//
+// جديد في v9 (تجهيز المشروع ليكون تجاري):
+// - الـ system prompt بقى جزئين: تعليمات ثابتة في الكود (AGENT_SYSTEM_
+//   INSTRUCTION، بروتوكول/كتالوج الأدوات) + سياق نشاط تجاري ديناميكي محفوظ
+//   في KV (config:business-context)، بيتدمجوا وقت المعالجة عبر
+//   buildFinalSystemInstruction(). التعديل عليه بقى من غير أي deploy جديد.
+// - 3 endpoints جديدة تحت /admin (محمية بمفتاح ADMIN_KEY منفصل عن
+//   STATUS_KEY):
+//     GET  /admin/business-context   — عرض السياق الحالي + الـ prompt الكامل
+//     POST /admin/business-context   — استبدال يدوي مباشر {"text": "..."}
+//     POST /admin/upload-context     — رفع ملف أو اتنين (multipart، حقل
+//                                       file)، بيتبعتوا لـ Gemini (inline
+//                                       PDF/document support) يدمجهم مع
+//                                       السياق الحالي في ملخص واحد (حد
+//                                       أقصى ~500 كلمة) ويحفظه.
+// - ترتيب المحاولة اتعكس: Gemini أولاً (جودة أعلى)، Workers AI احتياطي.
+// - محتاج secret جديد: ADMIN_KEY.
 //
 // جديد في v8:
 // - مستهلك منفصل لطابور zernio-events-dlq: بيسجل الرسائل اللي استنفدت كل
@@ -63,7 +80,7 @@ const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 // الترتيب = ترتيب المحاولة الفعلي.
 const WORKERS_AI_MODELS = [
-  "@cf/google/gemma-3-12b-it",
+  "@cf/meta/llama-3.2-3b-instruct",
   "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it",
 ];
@@ -399,12 +416,14 @@ function parseCommaList(value) {
 
 function buildModelCombos(env) {
   const combos = [];
-  for (const model of WORKERS_AI_MODELS) combos.push({ provider: "workers-ai", model });
 
+  // Gemini أولاً — جودة أعلى للنشاط التجاري، Workers AI احتياطي مجاني بعده.
   const geminiKeys = parseCommaList(env.GEMINI_API_KEY);
   const geminiModels = parseCommaList(env.GEMINI_MODELS);
   const finalGeminiModels = geminiModels.length ? geminiModels : DEFAULT_GEMINI_MODELS;
   for (const model of finalGeminiModels) for (const key of geminiKeys) combos.push({ provider: "gemini", model, key });
+
+  for (const model of WORKERS_AI_MODELS) combos.push({ provider: "workers-ai", model });
 
   return combos;
 }
@@ -512,6 +531,46 @@ async function callModelTurn(env, contents, systemInstruction, combo, attemptsLo
   return callGeminiTurnFixed(env, contents, systemInstruction, combo, attemptsLog);
 }
 
+// نداء Gemini منفصل خاص بتلخيص/دمج ملفات سياق النشاط التجاري — رد نصي حر
+// (مش JSON action)، فمش بنستخدم فيه callGeminiTurnFixed العادي.
+async function callGeminiForSummary(env, promptParts) {
+  const keys = parseCommaList(env.GEMINI_API_KEY);
+  if (!keys.length) throw new Error("مفيش GEMINI_API_KEY متظبط");
+  const models = parseCommaList(env.GEMINI_MODELS);
+  const model = models[0] || DEFAULT_GEMINI_MODELS[0];
+
+  const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": keys[0] },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: promptParts }],
+      generationConfig: { temperature: 0.2 },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Gemini summary HTTP ${res.status}: ${errText.slice(0, 300)}`);
+  }
+
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  const parts = (candidate && candidate.content && candidate.content.parts) || [];
+  return parts.map((p) => p.text || "").join("\n").trim();
+}
+
+// تحويل ArrayBuffer لـ base64 على دفعات — تجنّب تجاوز حد الأرجيومنتس لو
+// الملف كبير نسبيًا.
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 // -----------------------------------------------------------------------------
 // 5) حلقة الوكيل: Plan → Act → Reflect
 // -----------------------------------------------------------------------------
@@ -548,6 +607,19 @@ const AGENT_SYSTEM_INSTRUCTION = [
   "4. لما تكون متأكد إن العملية اللي هتنفذها هي آخر حاجة مطلوبة، استخدم done:true بدل ما تاخد دور إضافي بس عشان تقول final.",
 ].join("\n");
 
+const BUSINESS_CONTEXT_KV_KEY = "config:business-context";
+const BUSINESS_CONTEXT_MAX_WORDS = 500;
+
+// بيدمج سياق النشاط التجاري الديناميكي (من KV، بيتغير من غير deploy) مع
+// التعليمات الثابتة (بروتوكول/كتالوج الأدوات، بيتغير بس لما نحسّن الوكيل
+// نفسه). لو مفيش سياق متظبط لسه، بيرجع التعليمات الثابتة لوحدها — يعني
+// النظام شغال حتى قبل أول إعداد لنشاط تجاري.
+function buildFinalSystemInstruction(businessContextText) {
+  const text = (businessContextText || "").trim();
+  if (!text) return AGENT_SYSTEM_INSTRUCTION;
+  return ["── معلومات النشاط التجاري اللي بترد نيابة عنه ──", text, "", AGENT_SYSTEM_INSTRUCTION].join("\n");
+}
+
 function extractJsonObject(text) {
   if (!text) return null;
   let cleaned = String(text).trim();
@@ -578,7 +650,7 @@ function extractJsonObject(text) {
   return null;
 }
 
-async function runAgentLoopWithModel(env, rawEventText, combo, eventId) {
+async function runAgentLoopWithModel(env, rawEventText, combo, eventId, systemInstruction) {
   const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
   const steps = [];
   const geminiAttempts = [];
@@ -586,7 +658,7 @@ async function runAgentLoopWithModel(env, rawEventText, combo, eventId) {
   for (let i = 0; i < MAX_AGENT_STEPS; i++) {
     let rawText;
     try {
-      rawText = await callModelTurn(env, contents, AGENT_SYSTEM_INSTRUCTION, combo, geminiAttempts);
+      rawText = await callModelTurn(env, contents, systemInstruction, combo, geminiAttempts);
     } catch (err) {
       return { ok: false, steps, finalText: null, stopReason: "error", error: err.message, geminiAttempts };
     }
@@ -658,7 +730,7 @@ async function runAgentLoopWithModel(env, rawEventText, combo, eventId) {
   return { ok: true, steps, finalText: null, stopReason: "max-steps", geminiAttempts };
 }
 
-async function runAgentLoop(env, rawEventText, eventId) {
+async function runAgentLoop(env, rawEventText, eventId, systemInstruction) {
   const combos = buildModelCombos(env);
   if (!combos.length) {
     return { steps: [], finalText: null, stopReason: "error", error: "مفيش أي provider متظبط", geminiAttempts: [] };
@@ -670,7 +742,7 @@ async function runAgentLoop(env, rawEventText, eventId) {
   const allAttempts = [];
   let lastResult = null;
   for (const combo of combos) {
-    const result = await runAgentLoopWithModel(env, rawEventText, combo, eventId);
+    const result = await runAgentLoopWithModel(env, rawEventText, combo, eventId, systemInstruction);
     allAttempts.push(...(result.geminiAttempts || []));
     if (result.ok) return { ...result, geminiAttempts: allAttempts };
     lastResult = { ...result, geminiAttempts: allAttempts };
@@ -776,7 +848,10 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       }
     }
 
-    const trace = await runAgentLoop(env, rawEventText, eventId);
+    const bizStored = await kvGetJSON(env, BUSINESS_CONTEXT_KV_KEY);
+    const systemInstruction = buildFinalSystemInstruction(bizStored && bizStored.text);
+
+    const trace = await runAgentLoop(env, rawEventText, eventId, systemInstruction);
 
     const finishedAt = isoNow();
     const entry = {
@@ -914,6 +989,7 @@ async function handleHealth(request, env) {
     GEMINI_API_KEY: !!env.GEMINI_API_KEY,
     CLOUDFLARE_API_TOKEN: !!env.CLOUDFLARE_API_TOKEN,
     CLOUDFLARE_ACCOUNT_ID: !!env.CLOUDFLARE_ACCOUNT_ID,
+    ADMIN_KEY: !!env.ADMIN_KEY,
   };
 
   let zernioRest = { connected: false };
@@ -1044,7 +1120,102 @@ setInterval(refresh, 5000);
 }
 
 // -----------------------------------------------------------------------------
-// 11) نقطة الدخول الرئيسية
+// 11) /admin — إدارة سياق النشاط التجاري (الجزء الديناميكي من الـ system prompt)
+// -----------------------------------------------------------------------------
+//
+// كلهم محميين بـ ADMIN_KEY (منفصل عن STATUS_KEY بتاع الداشبورد للقراءة فقط
+// — القدرة على تغيير رد النشاط التجاري أخطر من مجرد متابعته).
+
+function checkAdminKey(request, env) {
+  const url = new URL(request.url);
+  return Boolean(env.ADMIN_KEY) && url.searchParams.get("key") === env.ADMIN_KEY;
+}
+
+// GET /admin/business-context — عرض السياق الديناميكي المحفوظ حاليًا، وشكل
+// الـ system prompt الكامل بعد الدمج (للمراجعة والتأكد).
+async function handleGetBusinessContext(request, env) {
+  if (!checkAdminKey(request, env)) {
+    return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
+  }
+  const stored = await kvGetJSON(env, BUSINESS_CONTEXT_KV_KEY);
+  const text = (stored && stored.text) || "";
+  return jsonResponse({
+    ok: true,
+    businessContext: text,
+    updatedAt: (stored && stored.updatedAt) || null,
+    fullSystemPrompt: buildFinalSystemInstruction(text),
+  });
+}
+
+// POST /admin/business-context — استبدال يدوي مباشر (body: {"text": "..."}) —
+// من غير أي معالجة Gemini، لتحرير نصي سريع.
+async function handlePostBusinessContext(request, env) {
+  if (!checkAdminKey(request, env)) {
+    return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return jsonResponse({ ok: false, error: "الجسم لازم يكون JSON صالح." }, 400);
+  }
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  if (!text) return jsonResponse({ ok: false, error: 'محتاج حقل "text" نصي غير فاضي.' }, 400);
+
+  await kvSetJSON(env, BUSINESS_CONTEXT_KV_KEY, { text, updatedAt: isoNow() });
+  return jsonResponse({ ok: true, businessContext: text });
+}
+
+// POST /admin/upload-context — رفع ملف أو اتنين (multipart/form-data، حقل
+// "file" مكرر لو اتنين)، بيتبعتوا لـ Gemini مع السياق الحالي (لو موجود)
+// عشان يرجّع ملخص واحد متجانس محدّث، وده اللي بيتحفظ كسياق جديد.
+async function handleUploadContext(request, env) {
+  if (!checkAdminKey(request, env)) {
+    return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
+  }
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (err) {
+    return jsonResponse({ ok: false, error: "الطلب لازم يكون multipart/form-data بحقل file." }, 400);
+  }
+
+  const files = form.getAll("file").filter((f) => f && typeof f.arrayBuffer === "function");
+  if (!files.length) return jsonResponse({ ok: false, error: 'محتاج ملف واحد على الأقل في حقل "file".' }, 400);
+  if (files.length > 2) return jsonResponse({ ok: false, error: "حد أقصى ملفين في المرة الواحدة." }, 400);
+
+  const existing = await kvGetJSON(env, BUSINESS_CONTEXT_KV_KEY);
+  const existingText = (existing && existing.text) || "";
+
+  const instruction =
+    "إنت مساعد بتلخّص مستندات نشاط تجاري عشان تتحط كسياق لوكيل رد آلي على عملاء عبر الرسائل والتعليقات. " +
+    (existingText ? `السياق الحالي المحفوظ فعلاً:\n${existingText}\n\n` : "") +
+    "ادمج السياق الحالي (لو موجود) مع محتوى الملف/الملفات المرفقة في ملخص واحد متجانس بالعربي، مركّز وعملي " +
+    "(الخدمات، الأسعار، السياسات، أسئلة شائعة)، حد أقصى تقريبًا " +
+    BUSINESS_CONTEXT_MAX_WORDS +
+    " كلمة. رجّع النص بس، من غير أي مقدمة أو markdown أو عناوين.";
+
+  const promptParts = [{ text: instruction }];
+  for (const file of files) {
+    const buf = await file.arrayBuffer();
+    promptParts.push({ inlineData: { mimeType: file.type || "application/octet-stream", data: arrayBufferToBase64(buf) } });
+  }
+
+  let summary;
+  try {
+    summary = await callGeminiForSummary(env, promptParts);
+  } catch (err) {
+    return jsonResponse({ ok: false, error: String((err && err.message) || err) }, 502);
+  }
+  if (!summary) return jsonResponse({ ok: false, error: "Gemini رجّع رد فاضي." }, 502);
+
+  await kvSetJSON(env, BUSINESS_CONTEXT_KV_KEY, { text: summary, updatedAt: isoNow() });
+  return jsonResponse({ ok: true, businessContext: summary, filesProcessed: files.length });
+}
+
+// -----------------------------------------------------------------------------
+// 12) نقطة الدخول الرئيسية
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1070,6 +1241,18 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/dashboard") {
         return await handleDashboard(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/admin/business-context") {
+        return await handleGetBusinessContext(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/admin/business-context") {
+        return await handlePostBusinessContext(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/admin/upload-context") {
+        return await handleUploadContext(request, env);
       }
 
       return textResponse("Not found", 404);
