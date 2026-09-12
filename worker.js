@@ -11,7 +11,7 @@ const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models
 const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 const WORKERS_AI_MODELS = [
-  "@cf/meta/llama-3.2-3b-instruct",
+  "@cf/google/gemma-3-12b-it",
   "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it"
 ];
