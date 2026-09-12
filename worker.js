@@ -1,8 +1,9 @@
 // =============================================================================
-// Bedaya Enterprise Agent (v20.0: Cloudflare Queues + DLQ + ReAct Agent + RAG)
+// Bedaya Enterprise Agent (Queues + DLQ + ReAct Agent + RAG + Full Audit Logs)
+// Worker URL: https://automation.nckalo018.workers.dev
 // =============================================================================
 
-// إعدادات وبيانات Zernio
+// إعدادات وبيانات Zernio الافتراضية (تُقرأ أيضاً من الأسرار إن وجدت)
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
 const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
 
@@ -11,7 +12,7 @@ const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models
 const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
 const WORKERS_AI_MODELS = [
-  "@cf/google/gemma-3-12b-it",
+  "@cf/meta/llama-3.2-3b-instruct",
   "@cf/meta/llama-3.2-11b-vision-instruct",
   "@cf/google/gemma-3-12b-it"
 ];
@@ -36,7 +37,7 @@ const corsHeaders = {
 };
 
 // -----------------------------------------------------------------------------
-// 1) دوال مساعدة عامة
+// 1) دوال المساعدة العامة
 // -----------------------------------------------------------------------------
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
@@ -69,6 +70,7 @@ function safeEqualHex(a, b) {
 
 function isoNow() { return new Date().toISOString(); }
 
+// تنظيف الرد ومنع تسريب التفكير والبرومبت
 function sanitizeAiResponse(rawText) {
   if (!rawText) return '';
   let cleaned = String(rawText).trim();
@@ -87,8 +89,18 @@ function sanitizeAiResponse(rawText) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) نظام تتبع الرسائل لـ 3 أيام (Audit Log)
+// 2) نظام السجلات الشامل والـ Audit Log لـ 3 أيام
 // -----------------------------------------------------------------------------
+async function writeLog(env, type, eventId, data) {
+  if (!env.ZERNIO_KV) return;
+  const key = `log:${isoNow()}:${eventId || "system"}:${type}`;
+  try {
+    await env.ZERNIO_KV.put(key, JSON.stringify({ type, eventId, timestamp: isoNow(), data }), {
+      expirationTtl: LOG_TTL_SECONDS,
+    });
+  } catch (_) {}
+}
+
 async function createAuditLog(env, logEntry) {
   if (!env.ZERNIO_KV) return;
   try {
@@ -132,24 +144,29 @@ async function updateAuditLog(env, logId, updateData) {
   } catch (_) {}
 }
 
-async function getRecentAuditLogs(env) {
+async function getAllLogs(env, limit = 100) {
   if (!env.ZERNIO_KV) return [];
   try {
+    // 1. جلب سجلات الـ Audit Logs المنظمة
     const rawIndex = await env.ZERNIO_KV.get('audit_logs_index');
-    if (!rawIndex) return [];
-    const index = JSON.parse(rawIndex);
-    const logs = await Promise.all(
-      index.slice(0, 50).map(async item => {
-        const raw = await env.ZERNIO_KV.get(`audit_log_${item.id}`);
-        return raw ? JSON.parse(raw) : null;
-      })
-    );
-    return logs.filter(Boolean);
-  } catch (_) { return []; }
+    let auditLogs = [];
+    if (rawIndex) {
+      const index = JSON.parse(rawIndex);
+      auditLogs = await Promise.all(
+        index.slice(0, limit).map(async item => {
+          const raw = await env.ZERNIO_KV.get(`audit_log_${item.id}`);
+          return raw ? JSON.parse(raw) : null;
+        })
+      );
+    }
+    return auditLogs.filter(Boolean);
+  } catch (_) {
+    return [];
+  }
 }
 
 // -----------------------------------------------------------------------------
-// 3) كتالوج العمليات وأدوات الوكيل (Zernio Tool Handlers)
+// 3) كتالوج أدوات الوكيل (Zernio Tool Handlers)
 // -----------------------------------------------------------------------------
 async function zernioFetch(env, path, options = {}) {
   const apiKey = (WORKER_ZERNIO_API_KEY || env.ZERNIO_API_KEY || '').trim();
@@ -170,7 +187,7 @@ async function zernioFetch(env, path, options = {}) {
 }
 
 function missingArgsError(names) {
-  return { ok: false, status: 0, data: { error: `محتاج الحقول دي: ${names.join(", ")}` } };
+  return { ok: false, status: 0, data: { error: `الحقول التالية مطلوبة: ${names.join(", ")}` } };
 }
 
 const CALL_HANDLERS = {
@@ -286,7 +303,7 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) محرك الذكاء الاصطناعي والـ System Prompt الديناميكي (مع الـ RAG)
+// 4) محرك الـ RAG والـ System Prompt الديناميكي
 // -----------------------------------------------------------------------------
 async function getDynamicAgentInstruction(env) {
   let customPrompt = 'أنت وكيل خدمة عملاء ومبيعات ذكي ومحترف، ترد بلباقة على استفسارات العملاء.';
@@ -306,10 +323,10 @@ async function getDynamicAgentInstruction(env) {
     "أنت وكيل ذكي للرد على رسائل الـ DMs والتعليقات الواردة من Zernio.",
     "نوعان فقط من الأحداث: event = \"message.received\" (DM) أو event = \"comment.received\" (تعليق).",
     "طريقة الرد الإلزامية: كل رد منك يجب أن يكون كائن JSON واحد فقط بالشكل التالي:",
-    '{"action": "call", "calls": [{"name": "sendMessage", "args": {"conversationId": "...", "accountId": "...", "message": "نص الرد العربي"}}], "done": true}',
+    '{"action": "call", "calls": [{"name": "sendMessage", "args": {"conversationId": "...", "accountId": "...", "message": "نص الرد العربي المباشر"}}], "done": true}',
     "",
-    "قواعد صارمة لطول النص:",
-    "1. الحد الأقصى لنص message في sendMessage أو replyToComment هو 300 حرف فقط لتفادي قيود المنصات.",
+    "قواعد صارمة لطول النص لمنع أخطاء المنصات:",
+    "1. الحد الأقصى لنص message في sendMessage أو replyToComment هو 300 حرف فقط.",
     "2. اكتب الرد المباشر بدون تكرار هذه التعليمات وبدون وسوم تفكير.",
     "",
     "── كتالوج أدوات الـ DM (event = message.received) ──",
@@ -409,7 +426,7 @@ function buildModelCombos(env) {
 }
 
 // -----------------------------------------------------------------------------
-// 5) حلقة تفكير الوكيل (ReAct Agent Execution Loop)
+// 5) حلقة تفكير الوكيل (ReAct Agent Loop)
 // -----------------------------------------------------------------------------
 async function runAgentLoop(env, rawEventText, eventId, auditLogId = null) {
   const systemInstruction = await getDynamicAgentInstruction(env);
@@ -469,7 +486,7 @@ async function runAgentLoop(env, rawEventText, eventId, auditLogId = null) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) معالجة الأحداث الواردة من Zernio
+// 6) معالجة أحداث Zernio
 // -----------------------------------------------------------------------------
 function extractAccountId(payload) { return (payload.account && (payload.account.id || payload.account.accountId)) || null; }
 function extractMessageContext(payload) { return { conversationId: payload.message?.conversationId, accountId: extractAccountId(payload) }; }
@@ -523,7 +540,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 7) مسارات الـ API (OAuth, Analytics, Prompt, RAG, Disconnect)
+// 7) مسارات الـ API (OAuth, Analytics, Logs, Prompt, RAG, Disconnect)
 // -----------------------------------------------------------------------------
 async function handleApiRequests(request, env, url) {
   const path = url.pathname;
@@ -531,7 +548,14 @@ async function handleApiRequests(request, env, url) {
   const API_KEY = (WORKER_ZERNIO_API_KEY || env.ZERNIO_API_KEY || '').trim();
   const PROFILE_ID = (WORKER_ZERNIO_PROFILE_ID || env.ZERNIO_PROFILE_ID || '').trim();
 
-  // 1. إحصائيات Zernio الرسمية (Volume Analytics)
+  // 1. مسار متابعة اللوج وسجل الأحداث كاملاً (Full Event & Audit Logs Endpoint) ⭐
+  if (method === 'GET' && (path === '/api/logs' || path === '/api/audit-logs')) {
+    const limit = parseInt(url.searchParams.get('limit') || '100', 10);
+    const logs = await getAllLogs(env, limit);
+    return jsonResponse({ ok: true, count: logs.length, logs });
+  }
+
+  // 2. إحصائيات Zernio الرسمية (Volume Analytics)
   if (method === 'GET' && path === '/api/analytics') {
     const today = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -546,7 +570,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 2. الحسابات المتصلة وفصل الحساب
+  // 3. الحسابات المتصلة وفصل الحساب
   if (method === 'GET' && path === '/api/accounts') {
     const zernioRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
     return jsonResponse(zernioRes.data, zernioRes.status);
@@ -559,12 +583,6 @@ async function handleApiRequests(request, env, url) {
     const zernioRes = await zernioFetch(env, `/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
     if (zernioRes.ok || zernioRes.status === 404) return jsonResponse({ ok: true, message: 'تم فصل الحساب بنجاح من Zernio' });
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
-  }
-
-  // 3. سجل تتبع الـ 3 أيام
-  if (method === 'GET' && path === '/api/audit-logs') {
-    const logs = await getRecentAuditLogs(env);
-    return jsonResponse({ ok: true, count: logs.length, logs });
   }
 
   // 4. لوحة نظرة عامة للأدمن
@@ -667,7 +685,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 8. محاكاة الشات المباشر
+  // 8. محاكاة الشات واختبار الوكيل
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي المنتجات والأسعار المتاحة؟';
@@ -695,7 +713,7 @@ async function handleApiRequests(request, env, url) {
 }
 
 // -----------------------------------------------------------------------------
-// 8) نقطة الدخول واستقبال الطوابير (Fetch & Queue Handlers)
+// 8) نقطة الدخول واستقبال الطوابير وفحص الـ Health
 // -----------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
@@ -703,6 +721,27 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
+    // مسارات فحص الحالة الأساسية (متروكة كما هي بدون أي مساس)
+    if (url.pathname === "/health") {
+      return jsonResponse({
+        status: "healthy",
+        service: "bedaya-enterprise-agent",
+        timestamp: isoNow(),
+        hasQueue: !!env.EVENTS_QUEUE,
+        hasKV: !!env.ZERNIO_KV
+      });
+    }
+
+    if (url.pathname === "/dashboard" || url.pathname === "/status") {
+      const logs = await getAllLogs(env, 20);
+      return jsonResponse({
+        status: "active",
+        agent: "Bedaya Enterprise Multi-Tenant AI Agent",
+        recentLogs: logs
+      });
+    }
+
+    // مسارات الـ API (المصادقة، اللوج، الـ RAG، والتحليلات)
     if (url.pathname.startsWith('/api/')) {
       return await handleApiRequests(request, env, url);
     }
@@ -712,7 +751,6 @@ export default {
       const receivedAt = isoNow();
       const rawBody = await request.text();
 
-      // فحص توقيع HMAC إن وجد
       const signature = request.headers.get("X-Zernio-Signature");
       if (signature && env.ZERNIO_WEBHOOK_SECRET) {
         const computed = await hmacSha256Hex(env.ZERNIO_WEBHOOK_SECRET, rawBody);
@@ -722,7 +760,6 @@ export default {
       let payload;
       try { payload = JSON.parse(rawBody); } catch (_) { return textResponse("Invalid JSON", 400); }
 
-      // فحص التكرار (Deduplication)
       const eventId = request.headers.get("X-Zernio-Event-Id") || payload.id;
       if (eventId && env.ZERNIO_KV) {
         const dedupKey = `dedup:${eventId}`;
@@ -735,19 +772,17 @@ export default {
       if (env.EVENTS_QUEUE) {
         await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
       } else {
-        // Fallback في حالة عدم تفعيل الـ Queue
         ctx.waitUntil(handleZernioEvent(env, rawBody, payload, receivedAt));
       }
 
       return jsonResponse({ ok: true, queued: true });
     }
 
-    return new Response('Bedaya Enterprise Agent Engine v20.0 Running with Cloudflare Queues.', { headers: corsHeaders });
+    return new Response('Bedaya Enterprise Agent Engine v20.0 Running with Queues.', { headers: corsHeaders });
   },
 
-  // مستهلك الطابور (Cloudflare Queue Consumer with Backoff)
+  // مستهلك الطابور (Cloudflare Queue Consumer with Exponential Backoff)
   async queue(batch, env) {
-    // 1. طابور الـ Dead Letter Queue (DLQ)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
         const { payload } = message.body || {};
@@ -762,7 +797,6 @@ export default {
       return;
     }
 
-    // 2. الطابور الرئيسي مع تأخير تصاعدي (Exponential Backoff)
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
@@ -771,7 +805,7 @@ export default {
       } catch (err) {
         console.error("Queue retry for event:", payload?.id, err.message);
         const attempt = message.attempts || 1;
-        const delaySeconds = Math.min(30 * Math.pow(2, attempt - 1), 1800); // 30s, 60s, 120s...
+        const delaySeconds = Math.min(30 * Math.pow(2, attempt - 1), 1800);
         message.retry({ delaySeconds });
       }
     }
