@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "zernio-social-inbox-agent",
-  "main": "workerv2.js",
+  "main": "worker.js",
   "compatibility_date": "2025-06-01",
   // KV namespace لتخزين: dedup الأحداث، اللوج، طابور المراجعة، وسياق
   // النشاط التجاري الديناميكي (config:business-context).
