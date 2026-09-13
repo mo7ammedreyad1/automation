@@ -1,40 +1,18 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-
-  "name": "zernio-social-inbox-agent",
-
+  "name": "bedaya-enterprise-agent",
   "main": "worker.js",
-
-  "compatibility_date": "2025-06-01",
-
-  // ===========================================================================
-  // KV
-  // ===========================================================================
-  // لتخزين:
-  // - dedup للأحداث
-  // - logs
-  // - review queue
-  // - business context
-  //
-  // الـ ID الموجود هو الـ KV namespace الحالي بتاعك.
+  "compatibility_date": "2026-03-01",
   "kv_namespaces": [
     {
       "binding": "ZERNIO_KV",
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
   ],
-
-  // ===========================================================================
-  // CLOUDFLARE QUEUES
-  // ===========================================================================
   "queues": {
     "producers": [
-      {
-        "queue": "zernio-events",
-        "binding": "EVENTS_QUEUE"
-      }
+      { "queue": "zernio-events", "binding": "EVENTS_QUEUE" }
     ],
-
     "consumers": [
       {
         "queue": "zernio-events",
@@ -43,52 +21,11 @@
         "max_retries": 5,
         "dead_letter_queue": "zernio-events-dlq"
       },
-
       {
         "queue": "zernio-events-dlq",
         "max_batch_size": 10,
         "max_batch_timeout": 30
       }
     ]
-  },
-
-  // ===========================================================================
-  // SERVICE BINDING
-  // ===========================================================================
-  // Worker الـZernio بيتصل مباشرة بـWorker الـAI Router
-  // من خلال:
-  //
-  //   env.AI_ROUTER.fetch(...)
-  //
-  // بدل:
-  //
-  //   fetch("https://ai.nckalo018.workers.dev/...")
-  //
-  // بالتالي الاتصال بيتم داخليًا بين الـWorkers ومش محتاجين
-  // HTTP request على workers.dev.
-  //
-  // IMPORTANT:
-  // قيمة "service" لازم تكون اسم Worker الخاص بالـAI Router.
-  // في إعدادك الحالي اسمه: ai
-  "services": [
-    {
-      "binding": "AI_ROUTER",
-      "service": "ai"
-    }
-  ]
-
-  // ===========================================================================
-  // SECRETS
-  // ===========================================================================
-  // الأسرار لا تتحط في الملف ده.
-  //
-  // مثال:
-  //
-  // npx wrangler secret put ZERNIO_API_KEY
-  // npx wrangler secret put ZERNIO_WEBHOOK_SECRET
-  // npx wrangler secret put ADMIN_KEY
-  // npx wrangler secret put STATUS_KEY
-  //
-  // مفاتيح Gemini / Groq الخاصة بالـAI Router تكون داخل Worker الـAI Router
-  // نفسه، وليس داخل Worker الـZernio.
+  }
 }
