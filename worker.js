@@ -1,43 +1,26 @@
 // =============================================================================
-// Zernio Social Inbox Agent — AI Router Edition
+// Zernio Social Inbox Agent — Cloudflare Worker (v9: نشاط تجاري + سياق ديناميكي)
 // =============================================================================
 //
-// هذا الملف يحافظ على منطق Zernio الأساسي:
-// - Webhook verification + dedup
-// - Zernio REST tools
-// - Cloudflare KV logs/context
-// - Cloudflare Queues + DLQ
-// - Dashboard + review queue
-// - Admin business context
-//
-// طبقة الذكاء تم استبدالها بالكامل بسيرفر AI Router خارجي:
-//   AI_ROUTER_URL
-//   AI_ROUTER_API_KEY
-//   AI_ROUTER_MODEL (اختياري)
-//
-// الـ AI Router هو المسؤول عن:
-// - Gemini/Groq KeyPool + ModelPool
-// - Failover
-// - اختيار الموديل والمفتاح
-// - إرجاع OpenAI-compatible response
-//
-// ملاحظة:
-// هذا الملف نفسه لا يحتوي أي اتصال مباشر إلى Gemini أو Workers AI.
+// المعمارية الحالية:
+// - استقبال Zernio Webhooks + التحقق من التوقيع + dedup.
+// - معالجة الأحداث عبر Cloudflare Queues مع Dead Letter Queue وإعادة محاولة.
+// - أدوات Zernio للـDM والتعليقات محفوظة كما هي.
+// - سياق النشاط التجاري محفوظ في KV ويتم دمجه مع الـsystem prompt وقت التشغيل.
+// - طبقة الذكاء الاصطناعي مفصولة في Worker مستقل اسمه ai.
+// - الاتصال بالـAI Router يتم فقط عبر Service Binding باسم AI_ROUTER،
+//   وليس عبر workers.dev أو أي URL عام.
+// - لا توجد داخل هذا الـWorker أي مفاتيح أو اتصالات مباشرة بمزودي النماذج.
 //
 // الأسرار المطلوبة:
-//   ZERNIO_API_KEY
-//   ZERNIO_WEBHOOK_SECRET
-//   AI_ROUTER_API_KEY
-//   ADMIN_KEY (اختياري)
-//   STATUS_KEY (اختياري)
+//   ZERNIO_API_KEY, ZERNIO_WEBHOOK_SECRET, ADMIN_KEY, STATUS_KEY (اختياري)
 //
-// Variables المطلوبة:
-//   AI_ROUTER_URL
-//   AI_ROUTER_MODEL (اختياري، الافتراضي auto)
+// Bindings المطلوبة:
+//   ZERNIO_KV       -> KV Namespace
+//   EVENTS_QUEUE    -> Cloudflare Queue producer/consumer
+//   AI_ROUTER       -> Service Binding إلى Worker اسمه ai
 //
-// Bindings:
-//   ZERNIO_KV
-//   EVENTS_QUEUE
+// ملاحظة: Worker الهدف (ai) لازم يكون منشورًا قبل نشر هذا الـWorker.
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -45,35 +28,24 @@
 // -----------------------------------------------------------------------------
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
-
-const AI_ROUTER_DEFAULT_MODEL = "auto";
-
+// الترتيب = ترتيب المحاولة الفعلي.
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
 const LOG_LIST_LIMIT = 30;
 
 const MAX_AGENT_STEPS = 10;
 
+// حد أقصى لوقت أي نداء REST واحد على Zernio.
 const CALL_TIMEOUT_MS = 15000;
-const AI_ROUTER_TIMEOUT_MS = 30000;
+// حد أقصى لوقت نداء واحد للـ AI Router.
+const AI_CALL_TIMEOUT_MS = 30000;
 
+// كام رسالة/تعليق نجيبهم تلقائيًا كسياق قبل أول دور للموديل.
 const AUTO_CONTEXT_LIMIT = 20;
 
 // -----------------------------------------------------------------------------
 // 2) أدوات مساعدة عامة
 // -----------------------------------------------------------------------------
-
-
-function getEnvString(val) {
-  if (typeof val === "string") return val.trim();
-  return "";
-}
-
-function getNumberEnv(val, defaultValue) {
-  if (val === undefined || val === null || val === "") return defaultValue;
-  const num = Number(val);
-  return isNaN(num) ? defaultValue : num;
-}
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
@@ -371,681 +343,196 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) عميل الـ AI Router الجديد
+// 4) عميل AI Router — Service Binding
 // -----------------------------------------------------------------------------
 //
-// هذا هو الاتصال الوحيد بطبقة الذكاء الاصطناعي.
-// لا يوجد هنا Gemini API مباشر ولا Workers AI.
+// الـ Worker ده لا يتصل بـ Gemini أو Groq مباشرةً.
+// كل استدعاءات الذكاء الاصطناعي تروح للـ Worker الخاص بالـ AI Router
+// من خلال Cloudflare Service Binding باسم AI_ROUTER.
 //
-// المتغيرات:
-//   AI_ROUTER_URL
-//   AI_ROUTER_API_KEY
-//   AI_ROUTER_MODEL (اختياري)
-// -----------------------------------------------------------------------------
+// ده مهم لأن Service Binding بيستدعي الـ Worker الآخر داخليًا من غير
+// المرور على Internet أو workers.dev URL.
+//
+// الواجهة المتوقعة من AI Router:
+//   POST /v1/chat
+//   POST /v1/summarize
+//
+// الـ client هنا دفاعي ويفهم عدة أشكال شائعة من response عشان مايبقاش
+// معتمد على wrapper واحد فقط.
 
-function normalizeRouterURL(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  return raw.replace(/\/+$/, "");
+function extractRouterText(data) {
+  const root = data && typeof data === "object" && "result" in data ? data.result : data;
+
+  if (typeof root === "string") return root;
+  if (!root || typeof root !== "object") return String(root ?? "");
+
+  const candidates = [
+    root.text,
+    root.response,
+    root.output_text,
+    root.output,
+    root.content,
+    root.reply,
+    root.answer,
+    root.message && root.message.content,
+    root.result && root.result.response,
+    root.result && root.result.text,
+    root.data && root.data.text,
+    root.data && root.data.response,
+    root.choices && root.choices[0] && root.choices[0].message && root.choices[0].message.content,
+    root.choices && root.choices[0] && root.choices[0].text,
+  ];
+
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value;
+  }
+
+  try {
+    return JSON.stringify(root);
+  } catch (_) {
+    return String(root);
+  }
 }
 
-function getRouterChatURL(env) {
-  // جلب الرابط وإزالة الأجزاء المكررة أو الزائدة
-  const base = normalizeRouterURL(env.AI_ROUTER_URL || "https://ai.nckalo018.workers.dev");
-  
-  if (!base) {
-    throw new Error("AI_ROUTER_URL مش متظبط.");
+async function aiRouterRequest(env, pathname, payload, attemptsLog, operationLabel) {
+  if (!env.AI_ROUTER || typeof env.AI_ROUTER.fetch !== "function") {
+    throw new Error("Service Binding AI_ROUTER مش متظبط على الـ Worker.");
   }
 
-  // إرجاع الرابط مباشرة بدون أي تعديل أو إضافات للمسار
-  return base;
-}
+  const startedAt = Date.now();
+  const requestUrl = `https://ai-router.internal${pathname}`;
+  let response;
+  let bodyText = "";
 
-  if (base.endsWith("/v1/chat/completions")) {
-    return base;
+  try {
+    response = await Promise.race([
+      env.AI_ROUTER.fetch(
+        new Request(requestUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-AI-Caller": "zernio-social-inbox-agent" },
+          body: JSON.stringify(payload),
+        })
+      ),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`انتهت مهلة AI Router (${AI_CALL_TIMEOUT_MS / 1000}s)`)),
+          AI_CALL_TIMEOUT_MS
+        )
+      ),
+    ]);
+
+    bodyText = await response.text();
+  } catch (err) {
+    const msg = `AI Router ${operationLabel} request error: ${(err && err.message) || err}`;
+    if (attemptsLog) {
+      attemptsLog.push({
+        provider: "ai-router",
+        operation: operationLabel,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        note: msg,
+      });
+    }
+    throw new Error(msg);
   }
 
-  if (base.endsWith("/v1")) {
-    return `${base}/chat/completions`;
+  let data;
+  try {
+    data = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_) {
+    data = { raw: bodyText.slice(0, 1000) };
   }
 
-  return `${base}/v1/chat/completions`;
-}
+  if (!response.ok) {
+    const errMsg =
+      data && Array.isArray(data.errors) && data.errors.length
+        ? data.errors.map((e) => e.message || e.code || e.error).join("; ")
+        : data && data.error
+          ? typeof data.error === "string"
+            ? data.error
+            : JSON.stringify(data.error)
+          : JSON.stringify(data).slice(0, 500);
 
-function getRouterModelsURL(env) {
-  const base = normalizeRouterURL(env.AI_ROUTER_URL);
-  if (!base) {
-    throw new Error("AI_ROUTER_URL مش متظبط.");
+    const msg = `AI Router HTTP ${response.status} (${operationLabel}): ${errMsg}`;
+    if (attemptsLog) {
+      attemptsLog.push({
+        provider: "ai-router",
+        operation: operationLabel,
+        status: response.status,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        note: msg,
+      });
+    }
+    throw new Error(msg);
   }
 
-  if (base.endsWith("/v1/models")) {
-    return base;
-  }
-
-  if (base.endsWith("/v1")) {
-    return `${base}/models`;
-  }
-
-  return `${base}/v1/models`;
-}
-
-function getRouterModel(env) {
-  const model =
-    typeof env.AI_ROUTER_MODEL === "string"
-      ? env.AI_ROUTER_MODEL.trim()
-      : "";
-
-  return model || AI_ROUTER_DEFAULT_MODEL;
-}
-
-function normalizeMessagesForRouter(systemInstruction, contents) {
-  const messages = [];
-
-  if (systemInstruction && String(systemInstruction).trim()) {
-    messages.push({
-      role: "system",
-      content: String(systemInstruction),
+  if (attemptsLog) {
+    attemptsLog.push({
+      provider: "ai-router",
+      operation: operationLabel,
+      status: response.status,
+      ok: true,
+      durationMs: Date.now() - startedAt,
     });
   }
 
-  for (const c of contents || []) {
-    const text = Array.isArray(c?.parts)
-      ? c.parts
-          .map((part) => {
-            if (!part) return "";
-            if (typeof part.text === "string") return part.text;
-            return "";
-          })
-          .filter(Boolean)
-          .join("\n")
-      : "";
+  return data;
+}
 
-    if (!text) continue;
+function contentsToMessages(systemInstruction, contents) {
+  const messages = [{ role: "system", content: systemInstruction }];
 
-    messages.push({
-      role: c.role === "model" ? "assistant" : "user",
-      content: text,
-    });
+  for (const c of contents) {
+    const text = (c.parts || []).map((p) => p.text || "").join("\n");
+    messages.push({ role: c.role === "model" ? "assistant" : "user", content: text });
   }
 
   return messages;
 }
 
-function extractRouterAssistantText(data) {
-  if (!data || typeof data !== "object") {
-    return "";
-  }
+async function callAIRouterTurn(env, contents, systemInstruction, attemptsLog) {
+  const messages = contentsToMessages(systemInstruction, contents);
 
-  // OpenAI-compatible:
-  if (Array.isArray(data.choices) && data.choices[0]) {
-    const choice = data.choices[0];
-
-    if (
-      choice.message &&
-      typeof choice.message.content === "string"
-    ) {
-      return choice.message.content;
-    }
-
-    if (typeof choice.text === "string") {
-      return choice.text;
-    }
-  }
-
-  // Defensive fallbacks:
-  if (typeof data.response === "string") {
-    return data.response;
-  }
-
-  if (
-    data.result &&
-    typeof data.result.response === "string"
-  ) {
-    return data.result.response;
-  }
-
-  if (typeof data.content === "string") {
-    return data.content;
-  }
-
-  return "";
-}
-
-function sanitizeAssistantText(text) {
-  if (typeof text !== "string") return "";
-
-  let result = text;
-
-  // إزالة reasoning blocks الشائعة لو ظهرت كنص.
-  result = result.replace(
-    /<think>[\s\S]*?<\/think>/gi,
-    ""
-  );
-
-  result = result.replace(
-    /<thinking>[\s\S]*?<\/thinking>/gi,
-    ""
-  );
-
-  // لو بدأ بلوك think ولم يُغلق، لا نسمح له بالخروج للعميل.
-  result = result.replace(
-    /^\s*<think>[\s\S]*$/i,
-    ""
-  );
-
-  result = result.replace(
-    /^\s*<thinking>[\s\S]*$/i,
-    ""
-  );
-
-  return result.trim();
-}
-
-function extractRouterDiagnostics(data) {
-  return {
-    requestId:
-      data?.id ||
-      data?.request_id ||
-      data?.requestId ||
-      null,
-
-    usage:
-      data?.usage ||
-      null,
-  };
-}
-
-async function callAIRouterTurn(
-  env,
-  contents,
-  systemInstruction,
-  attemptsLog
-) {
-  const url = getRouterChatURL(env);
-
-  const apiKey =
-    String(env.AI_ROUTER_API_KEY || "").trim();
-
-  if (!apiKey) {
-    throw new Error(
-      "AI_ROUTER_API_KEY مش متظبط."
-    );
-  }
-
-  const messages =
-    normalizeMessagesForRouter(
-      systemInstruction,
-      contents
-    );
-
-  if (!messages.length) {
-    throw new Error(
-      "مفيش messages صالحة لإرسالها للـAI Router."
-    );
-  }
-
-  const model = getRouterModel(env);
-
-  const body = {
-    model,
+  const payload = {
+    operation: "chat",
+    systemInstruction,
+    contents,
     messages,
-
-    temperature: 0.3,
-
-    stream: false,
+    responseFormat: "json",
+    responseMimeType: "application/json",
+    generationConfig: {
+      temperature: 0.3,
+    },
   };
 
-  const controller =
-    new AbortController();
+  const data = await aiRouterRequest(env, "/v1/chat", payload, attemptsLog, "chat");
+  return extractRouterText(data);
+}
 
-  const timer = setTimeout(
-    () => controller.abort(),
-    getNumberEnv(
-      env.AI_ROUTER_TIMEOUT_MS,
-      AI_ROUTER_TIMEOUT_MS
-    )
+async function callAIRouterForSummary(env, promptParts) {
+  const files = promptParts
+    .filter((part) => part && part.inlineData)
+    .map((part) => ({
+      mimeType: part.inlineData.mimeType || "application/octet-stream",
+      data: part.inlineData.data || "",
+    }));
+
+  const data = await aiRouterRequest(
+    env,
+    "/v1/summarize",
+    {
+      operation: "summarize",
+      promptParts,
+      files,
+      responseFormat: "text",
+      temperature: 0.2,
+    },
+    null,
+    "summarize"
   );
 
-  try {
-    const res = await fetch(
-      url,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-
-          Authorization:
-            `Bearer ${apiKey}`,
-        },
-
-        body:
-          JSON.stringify(body),
-
-        signal:
-          controller.signal,
-      }
-    );
-
-    clearTimeout(timer);
-
-    const contentType =
-      res.headers.get("content-type") ||
-      "";
-
-    let data;
-
-    if (
-      contentType.includes(
-        "application/json"
-      )
-    ) {
-      data =
-        await res.json().catch(() => ({}));
-    } else {
-      const text =
-        await res.text().catch(() => "");
-
-      try {
-        data = text
-          ? JSON.parse(text)
-          : {};
-      } catch {
-        data = {
-          raw: text.slice(0, 1000),
-        };
-      }
-    }
-
-    if (!res.ok) {
-      const message =
-        extractRouterErrorMessage(data);
-
-      const error =
-        new Error(
-          `AI Router HTTP ${res.status}: ${message}`
-        );
-
-      error.routerStatus =
-        res.status;
-
-      error.routerBody =
-        data;
-
-      if (attemptsLog) {
-        attemptsLog.push({
-          provider:
-            "ai-router",
-
-          model,
-
-          status:
-            res.status,
-
-          ok:
-            false,
-
-          note:
-            message,
-        });
-      }
-
-      throw error;
-    }
-
-    const rawText =
-      extractRouterAssistantText(
-        data
-      );
-
-    const cleanedText =
-      sanitizeAssistantText(
-        rawText
-      );
-
-    if (!cleanedText) {
-      const error =
-        new Error(
-          "AI Router رجّع رد فاضي."
-        );
-
-      error.routerStatus =
-        res.status;
-
-      error.routerBody =
-        data;
-
-      if (attemptsLog) {
-        attemptsLog.push({
-          provider:
-            "ai-router",
-
-          model,
-
-          status:
-            res.status,
-
-          ok:
-            false,
-
-          note:
-            "Empty assistant response",
-        });
-      }
-
-      throw error;
-    }
-
-    if (attemptsLog) {
-      const diagnostics =
-        extractRouterDiagnostics(
-          data
-        );
-
-      attemptsLog.push({
-        provider:
-          "ai-router",
-
-        model,
-
-        status:
-          res.status,
-
-        ok:
-          true,
-
-        requestId:
-          diagnostics.requestId,
-
-        usage:
-          diagnostics.usage,
-
-        note:
-          "Router response received",
-      });
-    }
-
-    return {
-      text:
-        cleanedText,
-
-      rawText:
-
-        rawText,
-
-      data:
-        data,
-
-      model:
-        data?.model ||
-        model,
-
-      headers: res.headers,
-    };
-  } catch (error) {
-    clearTimeout(timer);
-
-    if (attemptsLog &&
-        !attemptsLog.some(
-          (x) =>
-            x.provider === "ai-router" &&
-            x.ok === false &&
-            x.note &&
-            error?.message?.includes(x.note)
-        )) {
-      attemptsLog.push({
-        provider:
-          "ai-router",
-
-        model,
-
-        status:
-          error?.routerStatus ||
-          0,
-
-        ok:
-          false,
-
-        note:
-          error?.message ||
-          "AI Router request failed",
-      });
-    }
-
-    throw error;
-  }
-}
-
-function extractRouterErrorMessage(data) {
-  if (!data) {
-    return "Unknown AI Router error";
-  }
-
-  if (typeof data === "string") {
-    return data.slice(0, 500);
-  }
-
-  if (
-    data.error &&
-    typeof data.error === "string"
-  ) {
-    return data.error.slice(0, 500);
-  }
-
-  if (
-    data.error &&
-    typeof data.error.message === "string"
-  ) {
-    return data.error.message.slice(0, 500);
-  }
-
-  if (
-    Array.isArray(data.errors) &&
-    data.errors.length
-  ) {
-    return data.errors
-      .map(
-        (e) =>
-          e?.message ||
-          e?.code ||
-          String(e)
-      )
-      .join("; ")
-      .slice(0, 500);
-  }
-
-  if (
-    typeof data.message === "string"
-  ) {
-    return data.message.slice(0, 500);
-  }
-
-  try {
-    return JSON.stringify(data)
-      .slice(0, 500);
-  } catch {
-    return "Unknown AI Router error";
-  }
-}
-
-// نداء منفصل لتلخيص نصوص السياق باستخدام نفس الـAI Router.
-// لا يوجد هنا أي مزود AI مباشر.
-async function callAIRouterForSummary(
-  env,
-  promptText
-) {
-  const messages = [
-    {
-      role: "user",
-      content: String(promptText || ""),
-    },
-  ];
-
-  const controller =
-    new AbortController();
-
-  const timeoutMs =
-    getNumberEnv(
-      env.AI_ROUTER_TIMEOUT_MS,
-      AI_ROUTER_TIMEOUT_MS
-    );
-
-  const timer =
-    setTimeout(
-      () => controller.abort(),
-      timeoutMs
-    );
-
-  try {
-    const url =
-      getRouterChatURL(env);
-
-    const apiKey =
-      String(
-        env.AI_ROUTER_API_KEY || ""
-      ).trim();
-
-    if (!apiKey) {
-      throw new Error(
-        "AI_ROUTER_API_KEY مش متظبط."
-      );
-    }
-
-    const response =
-      await fetch(
-        url,
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json",
-
-            Authorization:
-              `Bearer ${apiKey}`,
-          },
-
-          body:
-            JSON.stringify({
-              model:
-                getRouterModel(env),
-
-              messages,
-
-              temperature:
-                0.2,
-
-              stream:
-                false,
-            }),
-
-          signal:
-            controller.signal,
-        }
-      );
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      ) || "";
-
-    let data;
-
-    if (
-      contentType.includes(
-        "application/json"
-      )
-    ) {
-      data =
-        await response
-          .json()
-          .catch(() => ({}));
-    } else {
-      const text =
-        await response
-          .text()
-          .catch(() => "");
-
-      try {
-        data =
-          text
-            ? JSON.parse(text)
-            : {};
-      } catch {
-        data = {
-          raw: text,
-        };
-      }
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        `AI Router summary HTTP ${response.status}: ${extractRouterErrorMessage(data)}`
-      );
-    }
-
-    const text =
-      sanitizeAssistantText(
-        extractRouterAssistantText(
-          data
-        )
-      );
-
-    if (!text) {
-      throw new Error(
-        "AI Router رجّع ملخص فاضي."
-      );
-    }
-
-    return text.trim();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// تحويل الملفات النصية فقط إلى نص يمكن إرساله للـAI Router.
-// PDF/DOCX والباقي binary يحتاج طبقة parsing مستقلة لو عايز دعمها.
-async function extractTextFromUploadedFile(file) {
-  const name =
-    String(
-      file?.name || ""
-    );
-
-  const type =
-    String(
-      file?.type || ""
-    ).toLowerCase();
-
-  const textLike =
-    type.startsWith("text/") ||
-    type.includes("json") ||
-    type.includes("csv") ||
-    type.includes("xml") ||
-    type.includes("javascript") ||
-    type.includes("html") ||
-    /\.(txt|md|csv|json|xml|html|htm|js|css)$/i.test(
-      name
-    );
-
-  if (!textLike) {
-    throw new Error(
-      `الملف "${name || "بدون اسم"}" نوعه ${type || "غير معروف"} وليس ملفًا نصيًا مدعومًا في هذه النسخة.`
-    );
-  }
-
-  const text =
-    await file.text();
-
-  return {
-    name:
-      name || "file",
-
-    type:
-      type || "text/plain",
-
-    text:
-      text,
-  };
+  return extractRouterText(data).trim();
 }
 
 // -----------------------------------------------------------------------------
@@ -1097,8 +584,6 @@ function buildFinalSystemInstruction(businessContextText) {
   return ["── معلومات النشاط التجاري اللي بترد نيابة عنه ──", text, "", AGENT_SYSTEM_INSTRUCTION].join("\n");
 }
 
-
-
 function extractJsonObject(text) {
   if (!text) return null;
   let cleaned = String(text).trim();
@@ -1129,559 +614,91 @@ function extractJsonObject(text) {
   return null;
 }
 
-async function runAgentLoopWithModel(
-  env,
-  rawEventText,
-  eventId,
-  modelOverride,
-  systemInstruction
-) {
-  const contents = [
-    {
-      role: "user",
-      parts: [
-        {
-          text:
-            rawEventText,
-        },
-      ],
-    },
-  ];
-
+async function runAgentLoopWithModel(env, rawEventText, eventId, systemInstruction, attemptsLog) {
+  const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
   const steps = [];
-  const aiRouterAttempts = [];
 
-  /*
-   * الـAI Router نفسه يملك ModelPool + KeyPool.
-   *
-   * لذلك لا نُنشئ combos هنا ولا نُدير مفاتيح AI داخل هذا الـWorker.
-   *
-   * لو AI_ROUTER_MODEL موجود:
-   *   نمرره للـRouter.
-   *
-   * لو غير موجود:
-   *   نستخدم auto.
-   */
-
-  const originalModel =
-    env.AI_ROUTER_MODEL;
-
-  if (
-    modelOverride &&
-    String(modelOverride).trim()
-  ) {
-    env.AI_ROUTER_MODEL =
-      String(modelOverride).trim();
-  }
-
-  try {
-    for (
-      let i = 0;
-      i < MAX_AGENT_STEPS;
-      i++
-    ) {
-      let rawText;
-
-      try {
-        const result =
-          await callAIRouterTurn(
-            env,
-            contents,
-            systemInstruction,
-            aiRouterAttempts
-          );
-
-        rawText =
-          result.text;
-      } catch (err) {
-        return {
-          ok:
-            false,
-
-          steps,
-
-          finalText:
-            null,
-
-          stopReason:
-            "error",
-
-          error:
-            err?.message ||
-            "AI Router error",
-
-          aiRouterAttempts,
-        };
-      }
-
-      const action =
-        extractJsonObject(
-          rawText
-        );
-
-
-      /*
-       * لو الـRouter رجّع JSON داخل markdown
-       * أو مع نص زائد، extractJsonObject يحاول
-       * استخراج الكائن.
-       */
-
-      if (
-        !action ||
-        typeof action.action !==
-          "string"
-      ) {
-        steps.push(
-          {
-            step:
-              i + 1,
-
-            ts:
-              isoNow(),
-
-            type:
-              "invalid-json",
-
-            raw:
-              String(
-                rawText
-              ).slice(
-                0,
-                600
-              ),
-          }
-        );
-
-        contents.push(
-          {
-            role:
-              "model",
-
-            parts:
-              [
-                {
-                  text:
-                    String(
-                      rawText
-                    ).slice(
-                      0,
-                      4000
-                    ),
-                },
-              ],
-          }
-        );
-
-        contents.push(
-          {
-            role:
-              "user",
-
-            parts:
-              [
-                {
-                  text:
-                    "ردك مش كائن JSON صالح بالشكل المطلوب. رجّع بس واحد من الشكلين المتفق عليهم: call أو final، من غير أي نص إضافي.",
-                },
-              ],
-          }
-        );
-
-        continue;
-      }
-
-
-      /* ------------------------------------------------------
-         FINAL
-         ------------------------------------------------------ */
-
-      if (
-        action.action ===
-        "final"
-      ) {
-        const finalText =
-          typeof action.text ===
-          "string"
-            ? sanitizeAssistantText(
-                action.text
-              )
-            : "";
-
-        steps.push(
-          {
-            step:
-              i + 1,
-
-            ts:
-              isoNow(),
-
-            type:
-              "final",
-
-            text:
-              finalText,
-          }
-        );
-
-        return {
-          ok:
-            true,
-
-          steps,
-
-          finalText,
-
-          stopReason:
-            "final",
-
-          aiRouterAttempts,
-        };
-      }
-
-
-      /* ------------------------------------------------------
-         TOOL CALL
-         ------------------------------------------------------ */
-
-      if (
-        action.action ===
-        "call"
-      ) {
-        let calls =
-          action.calls;
-
-
-        if (
-          calls &&
-          !Array.isArray(
-            calls
-          )
-        ) {
-          calls =
-            [
-              calls,
-            ];
-        }
-
-
-        if (
-          !Array.isArray(
-            calls
-          ) ||
-          calls.length === 0
-        ) {
-          steps.push(
-            {
-              step:
-                i + 1,
-
-              ts:
-                isoNow(),
-
-              type:
-                "empty-call",
-            }
-          );
-
-          contents.push(
-            {
-              role:
-                "model",
-
-              parts:
-                [
-                  {
-                    text:
-                      String(
-                        rawText
-                      ),
-                  },
-                ],
-            }
-          );
-
-          contents.push(
-            {
-              role:
-                "user",
-
-              parts:
-                [
-                  {
-                    text:
-                      "حقل calls فاضي أو مش array. لازم يكون فيه عملية واحدة على الأقل، وكل عملية فيها name و args.",
-                  },
-                ],
-            }
-          );
-
-          continue;
-        }
-
-
-        /*
-         * تنفيذ الأدوات الفعلي يظل هنا بالكامل.
-         * الـAI Router فقط هو الذي يقرر أي أداة
-         * يجب استدعاؤها.
-         */
-
-        const results =
-          await executeCalls(
-            env,
-            calls,
-            eventId
-          );
-
-
-        const allOk =
-          results.length > 0 &&
-          results.every(
-            (r) =>
-              r.ok
-          );
-
-
-        steps.push(
-          {
-            step:
-              i + 1,
-
-            ts:
-              isoNow(),
-
-            type:
-              "call",
-
-            calls:
-              calls
-                .slice(
-                  0,
-                  10
-                )
-                .map(
-                  (c) => ({
-                    name:
-                      c &&
-                      c.name,
-
-                    args:
-                      c &&
-                      c.args,
-                  })
-                ),
-
-            results:
-              results.map(
-                (r) => ({
-                  name:
-                    r.name,
-
-                  ok:
-                    r.ok,
-
-                  status:
-                    r.status,
-
-                  data:
-                    JSON.stringify(
-                      r.data
-                    ).slice(
-                      0,
-                      400
-                    ),
-                })
-              ),
-          }
-        );
-
-
-        if (
-          action.done ===
-            true &&
-          allOk
-        ) {
-          const summary =
-            `تم تلقائيًا (done:true): ${calls
-              .map(
-                (c) =>
-                  c &&
-                  c.name
-              )
-              .join(", ")}`;
-
-
-          return {
-            ok:
-              true,
-
-            steps,
-
-            finalText:
-              summary,
-
-            stopReason:
-              "final",
-
-            aiRouterAttempts,
-          };
-        }
-
-
-        contents.push(
-          {
-            role:
-              "model",
-
-            parts:
-              [
-                {
-                  text:
-                    String(
-                      rawText
-                    ).slice(
-                      0,
-                      5000
-                    ),
-                },
-              ],
-          }
-        );
-
-
-        contents.push(
-          {
-            role:
-              "user",
-
-            parts:
-              [
-                {
-                  text:
-                    `نتيجة تنفيذ العمليات:\n${JSON.stringify(
-                      results,
-                      null,
-                      2
-                    ).slice(
-                      0,
-                      6000
-                    )}`,
-                },
-              ],
-          }
-        );
-
-
-        continue;
-      }
-
-
-      /* ------------------------------------------------------
-         UNKNOWN ACTION
-         ------------------------------------------------------ */
-
-      steps.push(
-        {
-          step:
-            i + 1,
-
-          ts:
-            isoNow(),
-
-          type:
-            "unknown-action",
-
-          raw:
-            String(
-              action.action
-            ).slice(
-              0,
-              100
-            ),
-        }
-      );
-
-
-      contents.push(
-        {
-          role:
-            "model",
-
-          parts:
-            [
-              {
-                text:
-                  String(
-                    rawText
-                  ).slice(
-                    0,
-                    4000
-                  ),
-              },
-            ],
-        }
-      );
-
-
-      contents.push(
-        {
-          role:
-            "user",
-
-          parts:
-            [
-              {
-                text:
-                  `"action": "${action.action}" مش معروف. استخدم بس: call أو final.`,
-              },
-            ],
-        }
-      );
+  for (let i = 0; i < MAX_AGENT_STEPS; i++) {
+    let rawText;
+    try {
+      rawText = await callAIRouterTurn(env, contents, systemInstruction, attemptsLog);
+    } catch (err) {
+      return { ok: false, steps, finalText: null, stopReason: "error", error: err.message };
     }
 
+    const action = extractJsonObject(rawText);
 
-    return {
-      ok:
-        true,
+    if (!action || typeof action.action !== "string") {
+      steps.push({ step: i + 1, ts: isoNow(), type: "invalid-json", raw: String(rawText).slice(0, 300) });
+      contents.push({ role: "model", parts: [{ text: String(rawText).slice(0, 2000) }] });
+      contents.push({
+        role: "user",
+        parts: [{ text: "ردك مش كائن JSON صالح بالشكل المطلوب. رجّع بس واحد من الشكلين المتفق عليهم: call أو final، من غير أي نص إضافي." }],
+      });
+      continue;
+    }
 
-      steps,
+    if (action.action === "final") {
+      const finalText = typeof action.text === "string" ? action.text : "";
+      steps.push({ step: i + 1, ts: isoNow(), type: "final", text: finalText });
+      return { ok: true, steps, finalText, stopReason: "final" };
+    }
 
-      finalText:
-        null,
+    if (action.action === "call") {
+      let calls = action.calls;
+      if (calls && !Array.isArray(calls)) calls = [calls];
+      if (!Array.isArray(calls) || calls.length === 0) {
+        steps.push({ step: i + 1, ts: isoNow(), type: "empty-call" });
+        contents.push({ role: "model", parts: [{ text: rawText }] });
+        contents.push({
+          role: "user",
+          parts: [{ text: "حقل calls فاضي أو مش array. لازم يكون فيه عملية واحدة على الأقل، كل واحدة فيها name و args." }],
+        });
+        continue;
+      }
 
-      stopReason:
-        "max-steps",
+      const results = await executeCalls(env, calls, eventId);
+      const allOk = results.length > 0 && results.every((r) => r.ok);
 
-      aiRouterAttempts,
-    };
-  } finally {
-    /*
-     * لا نريد أن نغيّر قيمة الـenv بشكل دائم
-     * داخل نفس invocation.
-     */
-    env.AI_ROUTER_MODEL =
-      originalModel;
+      steps.push({
+        step: i + 1,
+        ts: isoNow(),
+        type: "call",
+        calls: calls.slice(0, 10).map((c) => ({ name: c && c.name, args: c && c.args })),
+        results: results.map((r) => ({
+          name: r.name,
+          ok: r.ok,
+          status: r.status,
+          data: JSON.stringify(r.data).slice(0, 400),
+        })),
+      });
+
+      if (action.done === true && allOk) {
+        const summary = `تم تلقائيًا (done:true): ${calls.map((c) => c && c.name).join(", ")}`;
+        return { ok: true, steps, finalText: summary, stopReason: "final" };
+      }
+
+      contents.push({ role: "model", parts: [{ text: rawText }] });
+      contents.push({ role: "user", parts: [{ text: `نتيجة تنفيذ العمليات:\n${JSON.stringify(results, null, 2).slice(0, 4000)}` }] });
+      continue;
+    }
+
+    steps.push({ step: i + 1, ts: isoNow(), type: "unknown-action", raw: String(action.action).slice(0, 100) });
+    contents.push({ role: "model", parts: [{ text: rawText }] });
+    contents.push({
+      role: "user",
+      parts: [{ text: `"action": "${action.action}" مش معروف. استخدم بس: call أو final.` }],
+    });
   }
+
+  return { ok: true, steps, finalText: null, stopReason: "max-steps" };
 }
 
-async function runAgentLoop(
-  env,
-  rawEventText,
-  eventId,
-  systemInstruction
-) {
-  const model =
-    (typeof env.AI_ROUTER_MODEL === "string" ? env.AI_ROUTER_MODEL.trim() : "") ||
-    AI_ROUTER_DEFAULT_MODEL;
-
-  return runAgentLoopWithModel(
-    env,
-    rawEventText,
-    eventId,
-    model,
-    systemInstruction
-  );
+async function runAgentLoop(env, rawEventText, eventId, systemInstruction) {
+  const attempts = [];
+  const result = await runAgentLoopWithModel(env, rawEventText, eventId, systemInstruction, attempts);
+  return { ...result, aiAttempts: attempts };
 }
-
 
 // -----------------------------------------------------------------------------
 // 6) معالجة الحدث الوارد
@@ -1794,7 +811,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       outcome: trace.stopReason,
       finalText: trace.finalText,
       error: trace.error,
-      aiRouterAttempts: trace.aiRouterAttempts,
+      aiAttempts: trace.aiAttempts,
       steps: trace.steps,
     };
 
@@ -1917,8 +934,7 @@ async function handleHealth(request, env) {
   const secrets = {
     ZERNIO_API_KEY: !!env.ZERNIO_API_KEY,
     ZERNIO_WEBHOOK_SECRET: !!env.ZERNIO_WEBHOOK_SECRET,
-    AI_ROUTER_API_KEY: !!env.AI_ROUTER_API_KEY,
-    AI_ROUTER_URL: !!env.AI_ROUTER_URL,
+    AI_ROUTER_SERVICE_BINDING: !!env.AI_ROUTER,
     ADMIN_KEY: !!env.ADMIN_KEY,
   };
 
@@ -2049,6 +1065,17 @@ setInterval(refresh, 5000);
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+// تحويل ArrayBuffer لـ base64 عند رفع ملفات السياق للـ AI Router.
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 // -----------------------------------------------------------------------------
 // 11) /admin — إدارة سياق النشاط التجاري (الجزء الديناميكي من الـ system prompt)
 // -----------------------------------------------------------------------------
@@ -2078,7 +1105,7 @@ async function handleGetBusinessContext(request, env) {
 }
 
 // POST /admin/business-context — استبدال يدوي مباشر (body: {"text": "..."}) —
-// من غير أي استدعاء AI، لتحرير نصي سريع.
+// من غير أي معالجة Gemini، لتحرير نصي سريع.
 async function handlePostBusinessContext(request, env) {
   if (!checkAdminKey(request, env)) {
     return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
@@ -2097,245 +1124,51 @@ async function handlePostBusinessContext(request, env) {
 }
 
 // POST /admin/upload-context — رفع ملف أو اتنين (multipart/form-data، حقل
-// "file" مكرر لو اتنين)، بيتبعتوا لـ Gemini مع السياق الحالي (لو موجود)
+// "file" مكرر لو اتنين)، بيتبعتوا للـ AI Router مع السياق الحالي (لو موجود)
 // عشان يرجّع ملخص واحد متجانس محدّث، وده اللي بيتحفظ كسياق جديد.
 async function handleUploadContext(request, env) {
   if (!checkAdminKey(request, env)) {
-    return jsonResponse(
-      {
-        ok: false,
-        error:
-          "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح.",
-      },
-      401
-    );
+    return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
   }
 
   let form;
-
   try {
-    form =
-      await request.formData();
+    form = await request.formData();
   } catch (err) {
-    return jsonResponse(
-      {
-        ok: false,
-
-        error:
-          "الطلب لازم يكون multipart/form-data بحقل file.",
-      },
-      400
-    );
+    return jsonResponse({ ok: false, error: "الطلب لازم يكون multipart/form-data بحقل file." }, 400);
   }
 
-  const files =
-    form
-      .getAll("file")
-      .filter(
-        (f) =>
-          f &&
-          typeof f.text ===
-            "function"
-      );
+  const files = form.getAll("file").filter((f) => f && typeof f.arrayBuffer === "function");
+  if (!files.length) return jsonResponse({ ok: false, error: 'محتاج ملف واحد على الأقل في حقل "file".' }, 400);
+  if (files.length > 2) return jsonResponse({ ok: false, error: "حد أقصى ملفين في المرة الواحدة." }, 400);
 
-
-  if (!files.length) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          'محتاج ملف واحد على الأقل في حقل "file".',
-      },
-      400
-    );
-  }
-
-
-  if (files.length > 2) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          "حد أقصى ملفين في المرة الواحدة.",
-      },
-      400
-    );
-  }
-
-
-  const existing =
-    await kvGetJSON(
-      env,
-      BUSINESS_CONTEXT_KV_KEY
-    );
-
-
-  const existingText =
-    (
-      existing &&
-      existing.text
-    ) ||
-    "";
-
-
-  const extractedFiles =
-    [];
-
-
-  try {
-    for (
-      const file of
-        files
-    ) {
-      const extracted =
-        await extractTextFromUploadedFile(
-          file
-        );
-
-      extractedFiles.push(
-        extracted
-      );
-    }
-  } catch (err) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          err?.message ||
-          String(err),
-      },
-      415
-    );
-  }
-
-
-  let combined =
-    "";
-
-
-  for (
-    const file of
-      extractedFiles
-  ) {
-    combined +=
-      `\n\n===== FILE: ${file.name} =====\n` +
-      file.text;
-  }
-
-
-  /*
-   * حماية من إدخال ملف ضخم جدًا في رسالة واحدة.
-   * الحد هنا لكل ملف بعد الاستخراج النصي.
-   */
-  const MAX_FILE_CHARS =
-    50000;
-
-
-  const safeCombined =
-    combined.slice(
-      0,
-      MAX_FILE_CHARS
-    );
-
+  const existing = await kvGetJSON(env, BUSINESS_CONTEXT_KV_KEY);
+  const existingText = (existing && existing.text) || "";
 
   const instruction =
-    [
-      "إنت مساعد بتلخّص مستندات نشاط تجاري عشان تتحط كسياق لوكيل رد آلي على العملاء عبر الرسائل والتعليقات.",
+    "إنت مساعد بتلخّص مستندات نشاط تجاري عشان تتحط كسياق لوكيل رد آلي على عملاء عبر الرسائل والتعليقات. " +
+    (existingText ? `السياق الحالي المحفوظ فعلاً:\n${existingText}\n\n` : "") +
+    "ادمج السياق الحالي (لو موجود) مع محتوى الملف/الملفات المرفقة في ملخص واحد متجانس بالعربي، مركّز وعملي " +
+    "(الخدمات، الأسعار، السياسات، أسئلة شائعة)، حد أقصى تقريبًا " +
+    BUSINESS_CONTEXT_MAX_WORDS +
+    " كلمة. رجّع النص بس، من غير أي مقدمة أو markdown أو عناوين.";
 
-      existingText
-        ? `السياق الحالي المحفوظ فعلاً:\n${existingText}\n`
-        : "",
-
-      "ادمج السياق الحالي (لو موجود) مع محتوى الملفات في ملخص واحد متجانس بالعربي، مركّز وعملي.",
-
-      "ركّز على الخدمات، الأسعار، السياسات، الشروط، أوقات العمل، طرق التواصل، والأسئلة الشائعة.",
-
-      `الحد الأقصى للملخص تقريبًا ${BUSINESS_CONTEXT_MAX_WORDS} كلمة.`,
-
-      "رجّع النص النهائي فقط، من غير مقدمة أو markdown أو تفسير لطريقة عملك.",
-
-      `محتوى الملفات:\n${safeCombined}`,
-    ]
-      .filter(Boolean)
-      .join(
-        "\n\n"
-      );
-
+  const promptParts = [{ text: instruction }];
+  for (const file of files) {
+    const buf = await file.arrayBuffer();
+    promptParts.push({ inlineData: { mimeType: file.type || "application/octet-stream", data: arrayBufferToBase64(buf) } });
+  }
 
   let summary;
-
-
   try {
-    summary =
-      await callAIRouterForSummary(
-        env,
-        instruction
-      );
+    summary = await callAIRouterForSummary(env, promptParts);
   } catch (err) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          String(
-            err?.message ||
-            err
-          ),
-      },
-      502
-    );
+    return jsonResponse({ ok: false, error: String((err && err.message) || err) }, 502);
   }
+  if (!summary) return jsonResponse({ ok: false, error: "AI Router رجّع رد فاضي." }, 502);
 
-
-  if (!summary) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          "AI Router رجّع رد فاضي.",
-      },
-      502
-    );
-  }
-
-
-  await kvSetJSON(
-    env,
-    BUSINESS_CONTEXT_KV_KEY,
-    {
-      text:
-        summary,
-
-      updatedAt:
-        isoNow(),
-    }
-  );
-
-
-  return jsonResponse(
-    {
-      ok:
-        true,
-
-      businessContext:
-        summary,
-
-      filesProcessed:
-        files.length,
-
-      aiProvider:
-        "ai-router",
-    }
-  );
+  await kvSetJSON(env, BUSINESS_CONTEXT_KV_KEY, { text: summary, updatedAt: isoNow() });
+  return jsonResponse({ ok: true, businessContext: summary, filesProcessed: files.length });
 }
 
 // -----------------------------------------------------------------------------
@@ -2412,17 +1245,6 @@ export default {
       return;
     }
 
-
-
-
-
-
-
-
-
-
-
-    
     // الطابور الرئيسي — تأخير متصاعد بين كل محاولة وإعادة المحاولة اللي
     // بعدها (30 ثانية، 60، 120، 240...) عشان لو المشكلة مؤقتة (ازدحام عند
     // موديل معين مثلاً) تاخد وقت تتعافى بدل ما نضرب في نفس الحيط فورًا.
