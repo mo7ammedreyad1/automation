@@ -8,13 +8,5 @@
       "binding": "ZERNIO_KV",
       "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
     }
-  ],
-  "queues": {
-    "producers": [
-      {
-        "queue": "zernio-events",
-        "binding": "EVENTS_QUEUE"
-      }
-    ]
-  }
+  ]
 }
