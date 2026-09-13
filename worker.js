@@ -1,6 +1,6 @@
 // =============================================================================
-// Bedaya Gateway & Auth Worker (v1.0 - Decoupled Microservice)
-// خادم البوابة، المصادقة الرسمية، الإحصائيات، وإدارة الحسابات والـ RAG
+// Bedaya Gateway, Auth & Billing Controller (v2.0 - Pure Gateway)
+// المسؤول فقط عن: المصادقة، إدارة الحسابات، الفوترة والحصص، الـ RAG والبرومبت
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -8,7 +8,16 @@ const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const CALL_TIMEOUT_MS = 15000;
-const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60; // 3 أيام
+
+// حدود الباقات الستة الرسمية (عدد المحادثات/الرسائل شهرياً)
+const PLAN_LIMITS = {
+  free: 100,
+  basic: 1500,
+  advance: 5000,
+  pro: Infinity,
+  biz: Infinity,
+  enterprise: Infinity
+};
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -31,24 +40,6 @@ function textResponse(text, status = 200) {
 }
 
 function isoNow() { return new Date().toISOString(); }
-
-function bufferToHex(buffer) {
-  return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function hmacSha256Hex(secret, rawBody) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(rawBody));
-  return bufferToHex(sig);
-}
-
-function safeEqualHex(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
 
 // -----------------------------------------------------------------------------
 // الاتصال بمنصة Zernio API
@@ -74,7 +65,46 @@ async function zernioFetch(env, path, options = {}) {
 }
 
 // -----------------------------------------------------------------------------
-// مسارات واجهة الـ API (المصادقة، الحسابات، الإحصائيات، البرومبت، والـ RAG)
+// محرك الفوترة ومراقبة الحصص (Billing & Quota Engine)
+// -----------------------------------------------------------------------------
+async function getBillingUsageAndStatus(env) {
+  const PROFILE_ID = (WORKER_ZERNIO_PROFILE_ID || env.ZERNIO_PROFILE_ID || '').trim();
+  
+  // 1. قراءة الباقة الحالية للمستخدم من الـ KV
+  const userPlan = env.ZERNIO_KV ? (await env.ZERNIO_KV.get('user_active_plan') || 'free').toLowerCase() : 'free';
+  const planLimit = PLAN_LIMITS[userPlan] !== undefined ? PLAN_LIMITS[userPlan] : 100;
+
+  // 2. جلب حجم الاستهلاك الفعلي للشهر الحالي من Zernio API
+  const now = new Date();
+  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+  const today = now.toISOString().split('T')[0];
+
+  const qs = new URLSearchParams({ fromDate: firstDayOfMonth, toDate: today, profileId: PROFILE_ID });
+  const zernioRes = await zernioFetch(env, `/analytics/inbox/volume?${qs}`);
+
+  let consumedMessages = 0;
+  if (zernioRes.ok && zernioRes.data?.summary) {
+    consumedMessages = (zernioRes.data.summary.sent || 0) + (zernioRes.data.summary.received || 0);
+  }
+
+  const isUnlimited = planLimit === Infinity;
+  const isExceeded = !isUnlimited && consumedMessages >= planLimit;
+  const remaining = isUnlimited ? 'غير محدود' : Math.max(0, planLimit - consumedMessages);
+  const usagePercentage = isUnlimited ? 0 : Math.min(100, Math.round((consumedMessages / planLimit) * 100));
+
+  return {
+    userPlan,
+    planLimit: isUnlimited ? 'غير محدود' : planLimit,
+    consumedMessages,
+    remaining,
+    usagePercentage,
+    isExceeded,
+    billingPeriod: { from: firstDayOfMonth, to: today }
+  };
+}
+
+// -----------------------------------------------------------------------------
+// توجيه ومعالجة مسارات الـ API (المصادقة، الفوترة، الحسابات، والـ RAG)
 // -----------------------------------------------------------------------------
 async function handleApiRequests(request, env, url) {
   const path = url.pathname;
@@ -82,7 +112,66 @@ async function handleApiRequests(request, env, url) {
   const API_KEY = (WORKER_ZERNIO_API_KEY || env.ZERNIO_API_KEY || '').trim();
   const PROFILE_ID = (WORKER_ZERNIO_PROFILE_ID || env.ZERNIO_PROFILE_ID || '').trim();
 
-  // 1. إحصائيات الرسائل الرسمية من Zernio (Inbox Volume Analytics)
+  // ---------------------------------------------------------------------------
+  // 1. مسارات الفوترة والحصص (Billing & Quota Management)
+  // ---------------------------------------------------------------------------
+  
+  // فحص حالة الباقة والاستهلاك
+  if (method === 'GET' && path === '/api/billing/status') {
+    const billingInfo = await getBillingUsageAndStatus(env);
+    return jsonResponse({ ok: true, billing: billingInfo });
+  }
+
+  // تحديث باقة المستخدم (من قِبل الأدمن أو عند الدفع)
+  if (method === 'POST' && path === '/api/billing/set-plan') {
+    const body = await request.json().catch(() => ({}));
+    const newPlan = (body.plan || 'free').toLowerCase();
+    if (!PLAN_LIMITS[newPlan] && PLAN_LIMITS[newPlan] !== 0) {
+      return jsonResponse({ error: 'اسم الباقة غير صالح (متاح: free, basic, advance, pro, biz, enterprise)' }, 400);
+    }
+
+    if (env.ZERNIO_KV) {
+      await env.ZERNIO_KV.put('user_active_plan', newPlan);
+      await env.ZERNIO_KV.put('plan_updated_at', isoNow());
+    }
+    return jsonResponse({ ok: true, message: `تم تحديث باقة الحساب إلى (${newPlan}) بنجاح` });
+  }
+
+  // تطبيق فحص الحصة وفصل الحسابات تلقائياً إذا انتهت الباقة (Enforce Limits)
+  if (method === 'POST' && path === '/api/billing/enforce') {
+    const billingInfo = await getBillingUsageAndStatus(env);
+
+    if (billingInfo.isExceeded) {
+      // جلب الحسابات المتصلة وفصلها من Zernio
+      const accsRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
+      const accounts = Array.isArray(accsRes.data) ? accsRes.data : (accsRes.data?.accounts || []);
+
+      const disconnected = [];
+      for (const acc of accounts) {
+        const id = acc.id || acc._id;
+        if (id) {
+          await zernioFetch(env, `/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          disconnected.push({ id, name: acc.name || acc.username });
+        }
+      }
+
+      if (env.ZERNIO_KV) await env.ZERNIO_KV.put('account_lock_status', 'locked_quota_exceeded');
+
+      return jsonResponse({
+        ok: true,
+        action: 'accounts_disconnected',
+        reason: 'انتهت حصة الباقة المخصصة',
+        disconnectedAccounts: disconnected,
+        billing: billingInfo
+      });
+    }
+
+    return jsonResponse({ ok: true, action: 'none', message: 'الاستهلاك ضمن حدود الباقة', billing: billingInfo });
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. إحصائيات Zernio الرسمية (Volume Analytics)
+  // ---------------------------------------------------------------------------
   if (method === 'GET' && path === '/api/analytics') {
     const today = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -98,13 +187,14 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 2. جلب الحسابات المتصلة حالياً في Zernio
+  // ---------------------------------------------------------------------------
+  // 3. الحسابات المتصلة وفصل الحسابات يدوياً
+  // ---------------------------------------------------------------------------
   if (method === 'GET' && path === '/api/accounts') {
     const zernioRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 3. فصل الحساب من Zernio بالـ ID
   if (method === 'DELETE' && path.startsWith('/api/accounts/')) {
     const accountId = path.split('/api/accounts/')[1];
     if (!accountId) return jsonResponse({ error: 'accountId مطلوب' }, 400);
@@ -119,7 +209,9 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. مسار تفويض فيسبوك (Get Auth URL)
+  // ---------------------------------------------------------------------------
+  // 4. مسارات OAuth فيسبوك (Facebook Official Connect)
+  // ---------------------------------------------------------------------------
   if (method === 'GET' && path === '/api/auth/facebook') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -127,7 +219,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 5. مسار جلب صفحات فيسبوك المتاحة بعد الـ OAuth
   if (method === 'GET' && path === '/api/auth/facebook/pages') {
     const tempToken = url.searchParams.get('tempToken');
     const connectToken = url.searchParams.get('connect_token') || request.headers.get('x-connect-token') || '';
@@ -141,7 +232,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 6. مسار تأكيد اختيار وربط صفحة فيسبوك
   if (method === 'POST' && path === '/api/auth/facebook/select') {
     const body = await request.json().catch(() => ({}));
     body.profileId = PROFILE_ID;
@@ -157,7 +247,9 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 7. مسار تفويض إنستغرام (Get Auth URL)
+  // ---------------------------------------------------------------------------
+  // 5. مسارات OAuth إنستغرام (Instagram Official Connect)
+  // ---------------------------------------------------------------------------
   if (method === 'GET' && path === '/api/auth/instagram') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
@@ -166,7 +258,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 8. مسار جلب حسابات إنستغرام المرتبطة بصفحات فيسبوك
   if (method === 'GET' && path === '/api/auth/instagram/accounts') {
     const tempToken = url.searchParams.get('tempToken');
     const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${PROFILE_ID}&tempToken=${encodeURIComponent(tempToken)}`;
@@ -174,7 +265,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 9. مسار تأكيد اختيار وربط حساب إنستغرام
   if (method === 'POST' && path === '/api/auth/instagram/select') {
     const body = await request.json().catch(() => ({}));
     body.profileId = PROFILE_ID;
@@ -186,12 +276,14 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 10. إدارة الـ System Prompt في الـ KV المشترك
+  // ---------------------------------------------------------------------------
+  // 6. إدارة الـ System Prompt ومستندات الـ RAG في الـ KV
+  // ---------------------------------------------------------------------------
   if (method === 'POST' && path === '/api/set-prompt') {
     const body = await request.json().catch(() => ({}));
     if (!body.prompt) return jsonResponse({ error: 'حقل prompt مفقود' }, 400);
     if (env.ZERNIO_KV) await env.ZERNIO_KV.put('custom_agent_prompt', body.prompt);
-    return jsonResponse({ ok: true, message: 'تم حفظ التعليمات بالسيرفر بنجاح' });
+    return jsonResponse({ ok: true, message: 'تم حفظ البرومبت بنجاح' });
   }
 
   if (method === 'GET' && path === '/api/get-prompt') {
@@ -199,7 +291,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 11. إدارة نصوص مستندات الـ RAG في الـ KV المشترك
   if (method === 'POST' && path === '/api/upload-rag-doc') {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
@@ -220,15 +311,19 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح قاعدة المعرفة بنجاح' });
   }
 
-  // 12. لوحة نظرة عامة للأدمن (Admin Overview)
+  // ---------------------------------------------------------------------------
+  // 7. نظرة عامة للأدمن (Admin Overview)
+  // ---------------------------------------------------------------------------
   if (method === 'GET' && path === '/api/admin/overview') {
     const prompt = env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null;
     const ragMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_meta') : null;
     const ragContent = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_content') : null;
+    const billing = await getBillingUsageAndStatus(env);
 
     return jsonResponse({
       ok: true,
-      service: "Bedaya Gateway Worker",
+      service: "Bedaya Pure Gateway & Billing Controller",
+      billing,
       prompt: prompt || 'البرومبت الافتراضي نشط',
       rag: {
         active: !!ragContent,
@@ -238,30 +333,11 @@ async function handleApiRequests(request, env, url) {
     });
   }
 
-  // 13. قراءة سجل الـ 3 أيام للوحة التحكم (Audit Logs)
-  if (method === 'GET' && path === '/api/audit-logs') {
-    if (!env.ZERNIO_KV) return jsonResponse({ ok: true, logs: [] });
-    try {
-      const rawIndex = await env.ZERNIO_KV.get('audit_logs_index');
-      if (!rawIndex) return jsonResponse({ ok: true, logs: [] });
-      const index = JSON.parse(rawIndex);
-      const logs = await Promise.all(
-        index.slice(0, 50).map(async item => {
-          const raw = await env.ZERNIO_KV.get(`audit_log_${item.id}`);
-          return raw ? JSON.parse(raw) : null;
-        })
-      );
-      return jsonResponse({ ok: true, count: logs.filter(Boolean).length, logs: logs.filter(Boolean) });
-    } catch (_) {
-      return jsonResponse({ ok: true, logs: [] });
-    }
-  }
-
-  return jsonResponse({ error: 'Endpoint not found on Gateway Worker' }, 404);
+  return jsonResponse({ error: 'المسار غير موجود في Gateway Worker' }, 404);
 }
 
 // -----------------------------------------------------------------------------
-// نقطة الدخول (Fetch Event) واستقبال الـ Webhook
+// نقطة الدخول (Fetch Event Handler)
 // -----------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
@@ -275,47 +351,6 @@ export default {
       return await handleApiRequests(request, env, url);
     }
 
-    // استقبال رسائل الويب هوك من Zernio ووضعها فوراً في الطابور
-    if (request.method === 'POST' && url.pathname === '/webhook/zernio') {
-      const receivedAt = isoNow();
-      const rawBody = await request.text();
-
-      // 1. التحقق من توقيع HMAC إن وجد
-      const signature = request.headers.get("X-Zernio-Signature");
-      if (signature && env.ZERNIO_WEBHOOK_SECRET) {
-        const computed = await hmacSha256Hex(env.ZERNIO_WEBHOOK_SECRET, rawBody);
-        if (!safeEqualHex(computed, signature)) {
-          return textResponse("Invalid HMAC signature", 400);
-        }
-      }
-
-      let payload;
-      try {
-        payload = JSON.parse(rawBody);
-      } catch (_) {
-        return textResponse("Invalid JSON payload", 400);
-      }
-
-      // 2. منع التكرار الفوري عبر الـ KV
-      const eventId = request.headers.get("X-Zernio-Event-Id") || payload.id;
-      if (eventId && env.ZERNIO_KV) {
-        const dedupKey = `dedup:${eventId}`;
-        const alreadySeen = await env.ZERNIO_KV.get(dedupKey).catch(() => null);
-        if (alreadySeen) {
-          return jsonResponse({ ok: true, dedup: true, message: "Duplicate event dropped" });
-        }
-        await env.ZERNIO_KV.put(dedupKey, "1", { expirationTtl: DEDUP_TTL_SECONDS }).catch(() => {});
-      }
-
-      // 3. إيداع الحدث في طابور Cloudflare Queues
-      if (env.EVENTS_QUEUE) {
-        await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
-      }
-
-      // رد فوري فائق السرعة (< 20ms) لمنع timeout من Meta/Zernio
-      return jsonResponse({ ok: true, queued: true, eventId });
-    }
-
-    return textResponse("Bedaya Gateway & Auth Worker Running (v1.0)");
+    return textResponse("Bedaya Gateway, Auth & Billing Controller Running (v2.0)");
   }
 };
