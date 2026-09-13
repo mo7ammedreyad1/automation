@@ -1,43 +1,74 @@
 // =============================================================================
-// Zernio Social Inbox Agent — AI Router Edition
+// Zernio Social Inbox Agent — Cloudflare Worker (v9: نشاط تجاري + سياق ديناميكي)
 // =============================================================================
 //
-// هذا الملف يحافظ على منطق Zernio الأساسي:
-// - Webhook verification + dedup
-// - Zernio REST tools
-// - Cloudflare KV logs/context
-// - Cloudflare Queues + DLQ
-// - Dashboard + review queue
-// - Admin business context
+// جديد في v9 (تجهيز المشروع ليكون تجاري):
+// - الـ system prompt بقى جزئين: تعليمات ثابتة في الكود (AGENT_SYSTEM_
+//   INSTRUCTION، بروتوكول/كتالوج الأدوات) + سياق نشاط تجاري ديناميكي محفوظ
+//   في KV (config:business-context)، بيتدمجوا وقت المعالجة عبر
+//   buildFinalSystemInstruction(). التعديل عليه بقى من غير أي deploy جديد.
+// - 3 endpoints جديدة تحت /admin (محمية بمفتاح ADMIN_KEY منفصل عن
+//   STATUS_KEY):
+//     GET  /admin/business-context   — عرض السياق الحالي + الـ prompt الكامل
+//     POST /admin/business-context   — استبدال يدوي مباشر {"text": "..."}
+//     POST /admin/upload-context     — رفع ملف أو اتنين (multipart، حقل
+//                                       file)، بيتبعتوا لـ Gemini (inline
+//                                       PDF/document support) يدمجهم مع
+//                                       السياق الحالي في ملخص واحد (حد
+//                                       أقصى ~500 كلمة) ويحفظه.
+// - ترتيب المحاولة اتعكس: Gemini أولاً (جودة أعلى)، Workers AI احتياطي.
+// - محتاج secret جديد: ADMIN_KEY.
 //
-// طبقة الذكاء تم استبدالها بالكامل بسيرفر AI Router خارجي:
-//   AI_ROUTER_URL
-//   AI_ROUTER_API_KEY
-//   AI_ROUTER_MODEL (اختياري)
+// جديد في v8:
+// - مستهلك منفصل لطابور zernio-events-dlq: بيسجل الرسائل اللي استنفدت كل
+//   محاولاتها في الطابور الرئيسي (بدل ما تفضل غير مرئية في داشبورد
+//   Cloudflare بس) — تحتاج wrangler.jsonc consumer entry إضافي لها (تحت).
+// - تأخير متصاعد بين محاولات إعادة المعالجة (30s, 60s, 120s...).
+// - شيل listComments و deleteComment من كتالوج الموديل في الـ system
+//   prompt (لسه شغالين داخليًا للجلب التلقائي، بس مش خيار للموديل).
 //
-// الـ AI Router هو المسؤول عن:
-// - Gemini/Groq KeyPool + ModelPool
-// - Failover
-// - اختيار الموديل والمفتاح
-// - إرجاع OpenAI-compatible response
+// جديد في v7:
 //
-// ملاحظة:
-// هذا الملف نفسه لا يحتوي أي اتصال مباشر إلى Gemini أو Workers AI.
+// 1) إعادة تصميم معمارية الاستقبال: بدل "عالج فورًا في الخلفية" (ctx.waitUntil)
+//    بقينا نستخدم Cloudflare Queues — /webhook/zernio دلوقتي بيحط الحدث في
+//    طابور بس (env.EVENTS_QUEUE.send(...)) ويرجع 200 فورًا. المعالجة الفعلية
+//    بتحصل في دالة queue() منفصلة (المستهلك/consumer). Cloudflare نفسها
+//    بتضمن التسليم: لو المعالجة فشلت (handleZernioEvent رمى استثناء)،
+//    بتعيد المحاولة تلقائيًا (max_retries)، وبعد استنفادها بتحط الرسالة في
+//    Dead Letter Queue بدل ما تضيع خالص — ده كان أهم مطلب.
+//    محتاج تعمل يدويًا قبل النشر:
+//      npx wrangler queues create zernio-events
+//      npx wrangler queues create zernio-events-dlq
+//    وتضيف في wrangler.jsonc:
+//      "queues": {
+//        "producers": [{ "queue": "zernio-events", "binding": "EVENTS_QUEUE" }],
+//        "consumers": [{
+//          "queue": "zernio-events", "max_batch_size": 5, "max_batch_timeout": 5,
+//          "max_retries": 5, "dead_letter_queue": "zernio-events-dlq"
+//        }]
+//      }
 //
-// الأسرار المطلوبة:
-//   ZERNIO_API_KEY
-//   ZERNIO_WEBHOOK_SECRET
-//   AI_ROUTER_API_KEY
-//   ADMIN_KEY (اختياري)
-//   STATUS_KEY (اختياري)
+// 2) استبدال @cf/deepseek-ai/deepseek-r1-distill-qwen-32b (موديل تفكير كان
+//    بيدخل في <think> طويل وبيقطع رده قبل ما يوصل لـ JSON خالص، وده كان
+//    السبب الحقيقي وراء عدم الرد على نسبة كبيرة من الرسائل) بـ
+//    @cf/meta/llama-3.2-3b-instruct — موديل مباشر بدون تفكير، أخف وأسرع.
 //
-// Variables المطلوبة:
-//   AI_ROUTER_URL
-//   AI_ROUTER_MODEL (اختياري، الافتراضي auto)
+// 3) إضافة max_tokens=1024 صريح لنداءات Workers AI — القيمة الافتراضية عند
+//    Cloudflare 256 بس، ودي كانت بتساهم في مشكلة القطع في رقم 2.
 //
-// Bindings:
-//   ZERNIO_KV
-//   EVENTS_QUEUE
+// ⚠️ postId في حدث comment.received لازم يكون platformPostId (مش postId/id
+// اللي ممكن يوصلوا فاضيين لو البوست مش منشور من خلال Zernio نفسها).
+//
+// الاستثناء الأمني الوحيد المكتوب في الكود: تجاهل أي حدث صادر من الحساب
+// نفسه (comment.author.isOwnAccount، أو message.direction != incoming).
+//
+// الأسرار المطلوبة (Cloudflare Dashboard أو wrangler secret put):
+//   ZERNIO_API_KEY, ZERNIO_WEBHOOK_SECRET, GEMINI_API_KEY,
+//   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+//   GEMINI_MODELS (اختياري), STATUS_KEY (اختياري)
+//
+// Bindings المطلوبة في wrangler.jsonc: ZERNIO_KV (KV)، EVENTS_QUEUE (Queue
+// producer/consumer زي فوق). الـ "ai" binding القديم اختياري (مش مستخدم).
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -45,10 +76,17 @@
 // -----------------------------------------------------------------------------
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
+const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
-const AI_ROUTER_URL = "https://ai.nckalo018.workers.dev/v1/chat/completions";
-const AI_ROUTER_API_KEY = "reyad-router-2026-super-secret";
-const AI_ROUTER_DEFAULT_MODEL = "auto";
+// الترتيب = ترتيب المحاولة الفعلي.
+const WORKERS_AI_MODELS = [
+  "@cf/meta/llama-3.2-3b-instruct",
+  "@cf/meta/llama-3.2-11b-vision-instruct",
+  "@cf/google/gemma-3-12b-it",
+];
+
+const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite"];
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -56,9 +94,17 @@ const LOG_LIST_LIMIT = 30;
 
 const MAX_AGENT_STEPS = 10;
 
+// حد أقصى لوقت أي نداء REST واحد على Zernio.
 const CALL_TIMEOUT_MS = 15000;
-const AI_ROUTER_TIMEOUT_MS = 30000;
+// حد أقصى لوقت نداء موديل واحد (Workers AI عن طريق REST) — أسخى شوية لأن
+// موديلات التفكير (reasoning) ممكن تاخد وقت أطول.
+const AI_CALL_TIMEOUT_MS = 30000;
 
+// حد التوكينز لرد الموديل — الافتراضي عند Cloudflare 256 بس، ده اللي كان
+// بيخلي موديل التفكير القديم يقطع رده في نص الكلام قبل ما يوصل لـ JSON.
+const WORKERS_AI_MAX_TOKENS = 1024;
+
+// كام رسالة/تعليق نجيبهم تلقائيًا كسياق قبل أول دور للموديل.
 const AUTO_CONTEXT_LIMIT = 20;
 
 // -----------------------------------------------------------------------------
@@ -361,625 +407,168 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) عميل الـ AI Router الجديد
-// -----------------------------------------------------------------------------
-//
-// هذا هو الاتصال الوحيد بطبقة الذكاء الاصطناعي.
-// لا يوجد هنا Gemini API مباشر ولا Workers AI.
-//
-// المتغيرات:
-//   AI_ROUTER_URL
-//   AI_ROUTER_API_KEY
-//   AI_ROUTER_MODEL (اختياري)
+// 4) عملاء الموديلات (Workers AI عن طريق REST أولاً، Gemini fallback)
 // -----------------------------------------------------------------------------
 
-function getRouterChatURL() {
-  return AI_ROUTER_URL;
+function parseCommaList(value) {
+  return (value || "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-function getRouterModel() {
-  return AI_ROUTER_DEFAULT_MODEL;
+function buildModelCombos(env) {
+  const combos = [];
+
+  // Gemini أولاً — جودة أعلى للنشاط التجاري، Workers AI احتياطي مجاني بعده.
+  const geminiKeys = parseCommaList(env.GEMINI_API_KEY);
+  const geminiModels = parseCommaList(env.GEMINI_MODELS);
+  const finalGeminiModels = geminiModels.length ? geminiModels : DEFAULT_GEMINI_MODELS;
+  for (const model of finalGeminiModels) for (const key of geminiKeys) combos.push({ provider: "gemini", model, key });
+
+  for (const model of WORKERS_AI_MODELS) combos.push({ provider: "workers-ai", model });
+
+  return combos;
 }
 
-function normalizeMessagesForRouter(systemInstruction, contents) {
-  const messages = [];
+async function callGeminiTurnFixed(env, contents, systemInstruction, combo, attemptsLog) {
+  const { key, model } = combo;
+  const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      contents,
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      generationConfig: { temperature: 0.3, responseMimeType: "application/json" },
+    }),
+  });
 
-  if (systemInstruction && String(systemInstruction).trim()) {
-    messages.push({
-      role: "system",
-      content: String(systemInstruction),
-    });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const msg = `Gemini HTTP ${res.status} (${model}): ${errText.slice(0, 300)}`;
+    if (attemptsLog) attemptsLog.push({ provider: "gemini", model, status: res.status, ok: false, note: msg });
+    throw new Error(msg);
   }
 
-  for (const c of contents || []) {
-    const text = Array.isArray(c?.parts)
-      ? c.parts
-          .map((part) => {
-            if (!part) return "";
-            if (typeof part.text === "string") return part.text;
-            return "";
-          })
-          .filter(Boolean)
-          .join("\n")
-      : "";
+  if (attemptsLog) attemptsLog.push({ provider: "gemini", model, status: res.status, ok: true });
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  const parts = (candidate && candidate.content && candidate.content.parts) || [];
+  return parts.map((p) => p.text || "").join("\n");
+}
 
-    if (!text) continue;
-
-    messages.push({
-      role: c.role === "model" ? "assistant" : "user",
-      content: text,
-    });
+function contentsToMessages(systemInstruction, contents) {
+  const messages = [{ role: "system", content: systemInstruction }];
+  for (const c of contents) {
+    const text = (c.parts || []).map((p) => p.text || "").join("\n");
+    messages.push({ role: c.role === "model" ? "assistant" : "user", content: text });
   }
-
   return messages;
 }
 
-function extractRouterAssistantText(data) {
-  if (!data || typeof data !== "object") {
-    return "";
+// دفاعي: أشكال رد مختلفة ممكنة — REST بيلف النتيجة في {result:{...}}.
+function extractWorkersAiText(data) {
+  const inner = data && typeof data === "object" && "result" in data ? data.result : data;
+  if (typeof inner === "string") return inner;
+  if (inner && typeof inner.response === "string") return inner.response;
+  if (inner && inner.result && typeof inner.result.response === "string") return inner.result.response;
+  if (inner && Array.isArray(inner.choices) && inner.choices[0] && inner.choices[0].message) {
+    return inner.choices[0].message.content || "";
   }
-
-  // OpenAI-compatible:
-  if (Array.isArray(data.choices) && data.choices[0]) {
-    const choice = data.choices[0];
-
-    if (
-      choice.message &&
-      typeof choice.message.content === "string"
-    ) {
-      return choice.message.content;
-    }
-
-    if (typeof choice.text === "string") {
-      return choice.text;
-    }
-  }
-
-  // Defensive fallbacks:
-  if (typeof data.response === "string") {
-    return data.response;
-  }
-
-  if (
-    data.result &&
-    typeof data.result.response === "string"
-  ) {
-    return data.result.response;
-  }
-
-  if (typeof data.content === "string") {
-    return data.content;
-  }
-
-  return "";
-}
-
-function sanitizeAssistantText(text) {
-  if (typeof text !== "string") return "";
-
-  let result = text;
-
-  // إزالة reasoning blocks الشائعة لو ظهرت كنص.
-  result = result.replace(
-    /<think>[\s\S]*?<\/think>/gi,
-    ""
-  );
-
-  result = result.replace(
-    /<thinking>[\s\S]*?<\/thinking>/gi,
-    ""
-  );
-
-  // لو بدأ بلوك think ولم يُغلق، لا نسمح له بالخروج للعميل.
-  result = result.replace(
-    /^\s*<think>[\s\S]*$/i,
-    ""
-  );
-
-  result = result.replace(
-    /^\s*<thinking>[\s\S]*$/i,
-    ""
-  );
-
-  return result.trim();
-}
-
-function extractRouterDiagnostics(data) {
-  return {
-    requestId:
-      data?.id ||
-      data?.request_id ||
-      data?.requestId ||
-      null,
-
-    usage:
-      data?.usage ||
-      null,
-  };
-}
-
-async function callAIRouterTurn(
-  env,
-  contents,
-  systemInstruction,
-  attemptsLog
-) {
-  const url = getRouterChatURL();
-
-  const apiKey =
-    AI_ROUTER_API_KEY;
-
-  if (!apiKey) {
-    throw new Error(
-      "AI_ROUTER_API_KEY مش متظبط."
-    );
-  }
-
-  const messages =
-    normalizeMessagesForRouter(
-      systemInstruction,
-      contents
-    );
-
-  if (!messages.length) {
-    throw new Error(
-      "مفيش messages صالحة لإرسالها للـAI Router."
-    );
-  }
-
-  const model = getRouterModel();
-
-  const body = {
-    model,
-    messages,
-
-    temperature: 0.3,
-
-    stream: false,
-  };
-
-  const controller =
-    new AbortController();
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    AI_ROUTER_TIMEOUT_MS
-  );
-
   try {
-    const res = await fetch(
-      url,
-      {
+    return JSON.stringify(inner);
+  } catch (_) {
+    return String(inner);
+  }
+}
+
+async function callWorkersAiTurn(env, contents, systemInstruction, combo, attemptsLog) {
+  const messages = contentsToMessages(systemInstruction, contents);
+  const url = `${CLOUDFLARE_AI_BASE}/${env.CLOUDFLARE_ACCOUNT_ID}/ai/run/${combo.model}`;
+
+  let res, bodyText;
+  try {
+    res = await Promise.race([
+      fetch(url, {
         method: "POST",
-
         headers: {
+          Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
           "Content-Type": "application/json",
-
-          Authorization:
-            `Bearer ${apiKey}`,
         },
-
-        body:
-          JSON.stringify(body),
-
-        signal:
-          controller.signal,
-      }
-    );
-
-    clearTimeout(timer);
-
-    const contentType =
-      res.headers.get("content-type") ||
-      "";
-
-    let data;
-
-    if (
-      contentType.includes(
-        "application/json"
-      )
-    ) {
-      data =
-        await res.json().catch(() => ({}));
-    } else {
-      const text =
-        await res.text().catch(() => "");
-
-      try {
-        data = text
-          ? JSON.parse(text)
-          : {};
-      } catch {
-        data = {
-          raw: text.slice(0, 1000),
-        };
-      }
-    }
-
-    if (!res.ok) {
-      const message =
-        extractRouterErrorMessage(data);
-
-      const error =
-        new Error(
-          `AI Router HTTP ${res.status}: ${message}`
-        );
-
-      error.routerStatus =
-        res.status;
-
-      error.routerBody =
-        data;
-
-      if (attemptsLog) {
-        attemptsLog.push({
-          provider:
-            "ai-router",
-
-          model,
-
-          status:
-            res.status,
-
-          ok:
-            false,
-
-          note:
-            message,
-        });
-      }
-
-      throw error;
-    }
-
-    const rawText =
-      extractRouterAssistantText(
-        data
-      );
-
-    const cleanedText =
-      sanitizeAssistantText(
-        rawText
-      );
-
-    if (!cleanedText) {
-      const error =
-        new Error(
-          "AI Router رجّع رد فاضي."
-        );
-
-      error.routerStatus =
-        res.status;
-
-      error.routerBody =
-        data;
-
-      if (attemptsLog) {
-        attemptsLog.push({
-          provider:
-            "ai-router",
-
-          model,
-
-          status:
-            res.status,
-
-          ok:
-            false,
-
-          note:
-            "Empty assistant response",
-        });
-      }
-
-      throw error;
-    }
-
-    if (attemptsLog) {
-      const diagnostics =
-        extractRouterDiagnostics(
-          data
-        );
-
-      attemptsLog.push({
-        provider:
-          "ai-router",
-
-        model,
-
-        status:
-          res.status,
-
-        ok:
-          true,
-
-        requestId:
-          diagnostics.requestId,
-
-        usage:
-          diagnostics.usage,
-
-        note:
-          "Router response received",
-      });
-    }
-
-    return {
-      text:
-        cleanedText,
-
-      rawText:
-
-        rawText,
-
-      data:
-        data,
-
-      model:
-        data?.model ||
-        model,
-
-      headers: res.headers,
-    };
-  } catch (error) {
-    clearTimeout(timer);
-
-    if (attemptsLog &&
-        !attemptsLog.some(
-          (x) =>
-            x.provider === "ai-router" &&
-            x.ok === false &&
-            x.note &&
-            error?.message?.includes(x.note)
-        )) {
-      attemptsLog.push({
-        provider:
-          "ai-router",
-
-        model,
-
-        status:
-          error?.routerStatus ||
-          0,
-
-        ok:
-          false,
-
-        note:
-          error?.message ||
-          "AI Router request failed",
-      });
-    }
-
-    throw error;
-  }
-}
-
-function extractRouterErrorMessage(data) {
-  if (!data) {
-    return "Unknown AI Router error";
+        body: JSON.stringify({ messages, response_format: { type: "json_object" }, max_tokens: WORKERS_AI_MAX_TOKENS }),
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`انتهت مهلة نداء Workers AI (${AI_CALL_TIMEOUT_MS / 1000}s)`)), AI_CALL_TIMEOUT_MS)
+      ),
+    ]);
+    bodyText = await res.text();
+  } catch (err) {
+    const msg = `Workers AI REST error (${combo.model}): ${(err && err.message) || err}`;
+    if (attemptsLog) attemptsLog.push({ provider: "workers-ai", model: combo.model, ok: false, note: msg });
+    throw new Error(msg);
   }
 
-  if (typeof data === "string") {
-    return data.slice(0, 500);
-  }
-
-  if (
-    data.error &&
-    typeof data.error === "string"
-  ) {
-    return data.error.slice(0, 500);
-  }
-
-  if (
-    data.error &&
-    typeof data.error.message === "string"
-  ) {
-    return data.error.message.slice(0, 500);
-  }
-
-  if (
-    Array.isArray(data.errors) &&
-    data.errors.length
-  ) {
-    return data.errors
-      .map(
-        (e) =>
-          e?.message ||
-          e?.code ||
-          String(e)
-      )
-      .join("; ")
-      .slice(0, 500);
-  }
-
-  if (
-    typeof data.message === "string"
-  ) {
-    return data.message.slice(0, 500);
-  }
-
+  let data;
   try {
-    return JSON.stringify(data)
-      .slice(0, 500);
-  } catch {
-    return "Unknown AI Router error";
+    data = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_) {
+    data = { raw: bodyText.slice(0, 500) };
   }
+
+  if (!res.ok) {
+    const errMsg =
+      data && Array.isArray(data.errors) && data.errors.length
+        ? data.errors.map((e) => e.message || e.code).join("; ")
+        : JSON.stringify(data).slice(0, 300);
+    const msg = `Workers AI REST HTTP ${res.status} (${combo.model}): ${errMsg}`;
+    if (attemptsLog) attemptsLog.push({ provider: "workers-ai", model: combo.model, status: res.status, ok: false, note: msg });
+    throw new Error(msg);
+  }
+
+  if (attemptsLog) attemptsLog.push({ provider: "workers-ai", model: combo.model, status: res.status, ok: true });
+  return extractWorkersAiText(data);
 }
 
-// نداء منفصل لتلخيص نصوص السياق باستخدام نفس الـAI Router.
-// لا يوجد هنا أي مزود AI مباشر.
-async function callAIRouterForSummary(
-  env,
-  promptText
-) {
-  const messages = [
-    {
-      role: "user",
-      content: String(promptText || ""),
-    },
-  ];
-
-  const controller =
-    new AbortController();
-
-  const timeoutMs =
-    AI_ROUTER_TIMEOUT_MS;
-
-  const timer =
-    setTimeout(
-      () => controller.abort(),
-      timeoutMs
-    );
-
-  try {
-    const url =
-      getRouterChatURL();
-
-    const apiKey = AI_ROUTER_API_KEY;
-
-    if (!apiKey) {
-      throw new Error(
-        "AI_ROUTER_API_KEY مش متظبط."
-      );
-    }
-
-    const response =
-      await fetch(
-        url,
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json",
-
-            Authorization:
-              `Bearer ${apiKey}`,
-          },
-
-          body:
-            JSON.stringify({
-              model:
-                getRouterModel(),
-
-              messages,
-
-              temperature:
-                0.2,
-
-              stream:
-                false,
-            }),
-
-          signal:
-            controller.signal,
-        }
-      );
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      ) || "";
-
-    let data;
-
-    if (
-      contentType.includes(
-        "application/json"
-      )
-    ) {
-      data =
-        await response
-          .json()
-          .catch(() => ({}));
-    } else {
-      const text =
-        await response
-          .text()
-          .catch(() => "");
-
-      try {
-        data =
-          text
-            ? JSON.parse(text)
-            : {};
-      } catch {
-        data = {
-          raw: text,
-        };
-      }
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        `AI Router summary HTTP ${response.status}: ${extractRouterErrorMessage(data)}`
-      );
-    }
-
-    const text =
-      sanitizeAssistantText(
-        extractRouterAssistantText(
-          data
-        )
-      );
-
-    if (!text) {
-      throw new Error(
-        "AI Router رجّع ملخص فاضي."
-      );
-    }
-
-    return text.trim();
-  } finally {
-    clearTimeout(timer);
-  }
+async function callModelTurn(env, contents, systemInstruction, combo, attemptsLog) {
+  if (combo.provider === "workers-ai") return callWorkersAiTurn(env, contents, systemInstruction, combo, attemptsLog);
+  return callGeminiTurnFixed(env, contents, systemInstruction, combo, attemptsLog);
 }
 
-// تحويل الملفات النصية فقط إلى نص يمكن إرساله للـAI Router.
-// PDF/DOCX والباقي binary يحتاج طبقة parsing مستقلة لو عايز دعمها.
-async function extractTextFromUploadedFile(file) {
-  const name =
-    String(
-      file?.name || ""
-    );
+// نداء Gemini منفصل خاص بتلخيص/دمج ملفات سياق النشاط التجاري — رد نصي حر
+// (مش JSON action)، فمش بنستخدم فيه callGeminiTurnFixed العادي.
+async function callGeminiForSummary(env, promptParts) {
+  const keys = parseCommaList(env.GEMINI_API_KEY);
+  if (!keys.length) throw new Error("مفيش GEMINI_API_KEY متظبط");
+  const models = parseCommaList(env.GEMINI_MODELS);
+  const model = models[0] || DEFAULT_GEMINI_MODELS[0];
 
-  const type =
-    String(
-      file?.type || ""
-    ).toLowerCase();
+  const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": keys[0] },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: promptParts }],
+      generationConfig: { temperature: 0.2 },
+    }),
+  });
 
-  const textLike =
-    type.startsWith("text/") ||
-    type.includes("json") ||
-    type.includes("csv") ||
-    type.includes("xml") ||
-    type.includes("javascript") ||
-    type.includes("html") ||
-    /\.(txt|md|csv|json|xml|html|htm|js|css)$/i.test(
-      name
-    );
-
-  if (!textLike) {
-    throw new Error(
-      `الملف "${name || "بدون اسم"}" نوعه ${type || "غير معروف"} وليس ملفًا نصيًا مدعومًا في هذه النسخة.`
-    );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Gemini summary HTTP ${res.status}: ${errText.slice(0, 300)}`);
   }
 
-  const text =
-    await file.text();
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  const parts = (candidate && candidate.content && candidate.content.parts) || [];
+  return parts.map((p) => p.text || "").join("\n").trim();
+}
 
-  return {
-    name:
-      name || "file",
-
-    type:
-      type || "text/plain",
-
-    text:
-      text,
-  };
+// تحويل ArrayBuffer لـ base64 على دفعات — تجنّب تجاوز حد الأرجيومنتس لو
+// الملف كبير نسبيًا.
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
 }
 
 // -----------------------------------------------------------------------------
@@ -1061,549 +650,106 @@ function extractJsonObject(text) {
   return null;
 }
 
-async function runAgentLoopWithModel(
-  env,
-  rawEventText,
-  eventId,
-  modelOverride,
-  systemInstruction
-) {
-  const contents = [
-    {
-      role: "user",
-      parts: [
-        {
-          text:
-            rawEventText,
-        },
-      ],
-    },
-  ];
-
+async function runAgentLoopWithModel(env, rawEventText, combo, eventId, systemInstruction) {
+  const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
   const steps = [];
-  const aiRouterAttempts = [];
-
-  /*
-   * الـAI Router نفسه يملك ModelPool + KeyPool.
-   *
-   * لذلك لا نُنشئ combos هنا ولا نُدير مفاتيح AI داخل هذا الـWorker.
-   *
-   * لو AI_ROUTER_MODEL موجود:
-   *   نمرره للـRouter.
-   *
-   * لو غير موجود:
-   *   نستخدم auto.
-   */
-
-  try {
-    for (
-      let i = 0;
-      i < MAX_AGENT_STEPS;
-      i++
-    ) {
-      let rawText;
-
-      try {
-        const result =
-          await callAIRouterTurn(
-            env,
-            contents,
-            systemInstruction,
-            aiRouterAttempts
-          );
-
-        rawText =
-          result.text;
-      } catch (err) {
-        return {
-          ok:
-            false,
-
-          steps,
-
-          finalText:
-            null,
-
-          stopReason:
-            "error",
-
-          error:
-            err?.message ||
-            "AI Router error",
-
-          aiRouterAttempts,
-        };
-      }
-
-      const action =
-        extractJsonObject(
-          rawText
-        );
-
-
-      /*
-       * لو الـRouter رجّع JSON داخل markdown
-       * أو مع نص زائد، extractJsonObject يحاول
-       * استخراج الكائن.
-       */
-
-      if (
-        !action ||
-        typeof action.action !==
-          "string"
-      ) {
-        steps.push(
-          {
-            step:
-              i + 1,
-
-            ts:
-              isoNow(),
-
-            type:
-              "invalid-json",
-
-            raw:
-              String(
-                rawText
-              ).slice(
-                0,
-                600
-              ),
-          }
-        );
-
-        contents.push(
-          {
-            role:
-              "model",
-
-            parts:
-              [
-                {
-                  text:
-                    String(
-                      rawText
-                    ).slice(
-                      0,
-                      4000
-                    ),
-                },
-              ],
-          }
-        );
-
-        contents.push(
-          {
-            role:
-              "user",
-
-            parts:
-              [
-                {
-                  text:
-                    "ردك مش كائن JSON صالح بالشكل المطلوب. رجّع بس واحد من الشكلين المتفق عليهم: call أو final، من غير أي نص إضافي.",
-                },
-              ],
-          }
-        );
-
-        continue;
-      }
-
-
-      /* ------------------------------------------------------
-         FINAL
-         ------------------------------------------------------ */
-
-      if (
-        action.action ===
-        "final"
-      ) {
-        const finalText =
-          typeof action.text ===
-          "string"
-            ? sanitizeAssistantText(
-                action.text
-              )
-            : "";
-
-        steps.push(
-          {
-            step:
-              i + 1,
-
-            ts:
-              isoNow(),
-
-            type:
-              "final",
-
-            text:
-              finalText,
-          }
-        );
-
-        return {
-          ok:
-            true,
-
-          steps,
-
-          finalText,
-
-          stopReason:
-            "final",
-
-          aiRouterAttempts,
-        };
-      }
-
-
-      /* ------------------------------------------------------
-         TOOL CALL
-         ------------------------------------------------------ */
-
-      if (
-        action.action ===
-        "call"
-      ) {
-        let calls =
-          action.calls;
-
-
-        if (
-          calls &&
-          !Array.isArray(
-            calls
-          )
-        ) {
-          calls =
-            [
-              calls,
-            ];
-        }
-
-
-        if (
-          !Array.isArray(
-            calls
-          ) ||
-          calls.length === 0
-        ) {
-          steps.push(
-            {
-              step:
-                i + 1,
-
-              ts:
-                isoNow(),
-
-              type:
-                "empty-call",
-            }
-          );
-
-          contents.push(
-            {
-              role:
-                "model",
-
-              parts:
-                [
-                  {
-                    text:
-                      String(
-                        rawText
-                      ),
-                  },
-                ],
-            }
-          );
-
-          contents.push(
-            {
-              role:
-                "user",
-
-              parts:
-                [
-                  {
-                    text:
-                      "حقل calls فاضي أو مش array. لازم يكون فيه عملية واحدة على الأقل، وكل عملية فيها name و args.",
-                  },
-                ],
-            }
-          );
-
-          continue;
-        }
-
-
-        /*
-         * تنفيذ الأدوات الفعلي يظل هنا بالكامل.
-         * الـAI Router فقط هو الذي يقرر أي أداة
-         * يجب استدعاؤها.
-         */
-
-        const results =
-          await executeCalls(
-            env,
-            calls,
-            eventId
-          );
-
-
-        const allOk =
-          results.length > 0 &&
-          results.every(
-            (r) =>
-              r.ok
-          );
-
-
-        steps.push(
-          {
-            step:
-              i + 1,
-
-            ts:
-              isoNow(),
-
-            type:
-              "call",
-
-            calls:
-              calls
-                .slice(
-                  0,
-                  10
-                )
-                .map(
-                  (c) => ({
-                    name:
-                      c &&
-                      c.name,
-
-                    args:
-                      c &&
-                      c.args,
-                  })
-                ),
-
-            results:
-              results.map(
-                (r) => ({
-                  name:
-                    r.name,
-
-                  ok:
-                    r.ok,
-
-                  status:
-                    r.status,
-
-                  data:
-                    JSON.stringify(
-                      r.data
-                    ).slice(
-                      0,
-                      400
-                    ),
-                })
-              ),
-          }
-        );
-
-
-        if (
-          action.done ===
-            true &&
-          allOk
-        ) {
-          const summary =
-            `تم تلقائيًا (done:true): ${calls
-              .map(
-                (c) =>
-                  c &&
-                  c.name
-              )
-              .join(", ")}`;
-
-
-          return {
-            ok:
-              true,
-
-            steps,
-
-            finalText:
-              summary,
-
-            stopReason:
-              "final",
-
-            aiRouterAttempts,
-          };
-        }
-
-
-        contents.push(
-          {
-            role:
-              "model",
-
-            parts:
-              [
-                {
-                  text:
-                    String(
-                      rawText
-                    ).slice(
-                      0,
-                      5000
-                    ),
-                },
-              ],
-          }
-        );
-
-
-        contents.push(
-          {
-            role:
-              "user",
-
-            parts:
-              [
-                {
-                  text:
-                    `نتيجة تنفيذ العمليات:\n${JSON.stringify(
-                      results,
-                      null,
-                      2
-                    ).slice(
-                      0,
-                      6000
-                    )}`,
-                },
-              ],
-          }
-        );
-
-
-        continue;
-      }
-
-
-      /* ------------------------------------------------------
-         UNKNOWN ACTION
-         ------------------------------------------------------ */
-
-      steps.push(
-        {
-          step:
-            i + 1,
-
-          ts:
-            isoNow(),
-
-          type:
-            "unknown-action",
-
-          raw:
-            String(
-              action.action
-            ).slice(
-              0,
-              100
-            ),
-        }
-      );
-
-
-      contents.push(
-        {
-          role:
-            "model",
-
-          parts:
-            [
-              {
-                text:
-                  String(
-                    rawText
-                  ).slice(
-                    0,
-                    4000
-                  ),
-              },
-            ],
-        }
-      );
-
-
-      contents.push(
-        {
-          role:
-            "user",
-
-          parts:
-            [
-              {
-                text:
-                  `"action": "${action.action}" مش معروف. استخدم بس: call أو final.`,
-              },
-            ],
-        }
-      );
+  const geminiAttempts = [];
+
+  for (let i = 0; i < MAX_AGENT_STEPS; i++) {
+    let rawText;
+    try {
+      rawText = await callModelTurn(env, contents, systemInstruction, combo, geminiAttempts);
+    } catch (err) {
+      return { ok: false, steps, finalText: null, stopReason: "error", error: err.message, geminiAttempts };
     }
 
+    const action = extractJsonObject(rawText);
 
-    return {
-      ok:
-        true,
+    if (!action || typeof action.action !== "string") {
+      steps.push({ step: i + 1, ts: isoNow(), type: "invalid-json", raw: String(rawText).slice(0, 300) });
+      contents.push({ role: "model", parts: [{ text: String(rawText).slice(0, 2000) }] });
+      contents.push({
+        role: "user",
+        parts: [{ text: "ردك مش كائن JSON صالح بالشكل المطلوب. رجّع بس واحد من الشكلين المتفق عليهم: call أو final، من غير أي نص إضافي." }],
+      });
+      continue;
+    }
 
-      steps,
+    if (action.action === "final") {
+      const finalText = typeof action.text === "string" ? action.text : "";
+      steps.push({ step: i + 1, ts: isoNow(), type: "final", text: finalText });
+      return { ok: true, steps, finalText, stopReason: "final", geminiAttempts };
+    }
 
-      finalText:
-        null,
+    if (action.action === "call") {
+      let calls = action.calls;
+      if (calls && !Array.isArray(calls)) calls = [calls];
+      if (!Array.isArray(calls) || calls.length === 0) {
+        steps.push({ step: i + 1, ts: isoNow(), type: "empty-call" });
+        contents.push({ role: "model", parts: [{ text: rawText }] });
+        contents.push({
+          role: "user",
+          parts: [{ text: "حقل calls فاضي أو مش array. لازم يكون فيه عملية واحدة على الأقل، كل واحدة فيها name و args." }],
+        });
+        continue;
+      }
 
-      stopReason:
-        "max-steps",
+      const results = await executeCalls(env, calls, eventId);
+      const allOk = results.length > 0 && results.every((r) => r.ok);
+      steps.push({
+        step: i + 1,
+        ts: isoNow(),
+        type: "call",
+        calls: calls.slice(0, 10).map((c) => ({ name: c && c.name, args: c && c.args })),
+        results: results.map((r) => ({
+          name: r.name,
+          ok: r.ok,
+          status: r.status,
+          data: JSON.stringify(r.data).slice(0, 400),
+        })),
+      });
 
-      aiRouterAttempts,
-    };
-  } finally {
-    // لا يوجد AI model في env؛ الـRouter هو المسؤول عن اختيار الموديل.
+      if (action.done === true && allOk) {
+        const summary = `تم تلقائيًا (done:true): ${calls.map((c) => c && c.name).join(", ")}`;
+        return { ok: true, steps, finalText: summary, stopReason: "final", geminiAttempts };
+      }
+
+      contents.push({ role: "model", parts: [{ text: rawText }] });
+      contents.push({ role: "user", parts: [{ text: `نتيجة تنفيذ العمليات:\n${JSON.stringify(results, null, 2).slice(0, 4000)}` }] });
+      continue;
+    }
+
+    steps.push({ step: i + 1, ts: isoNow(), type: "unknown-action", raw: String(action.action).slice(0, 100) });
+    contents.push({ role: "model", parts: [{ text: rawText }] });
+    contents.push({
+      role: "user",
+      parts: [{ text: `"action": "${action.action}" مش معروف. استخدم بس: call أو final.` }],
+    });
   }
+
+  return { ok: true, steps, finalText: null, stopReason: "max-steps", geminiAttempts };
 }
 
+async function runAgentLoop(env, rawEventText, eventId, systemInstruction) {
+  const combos = buildModelCombos(env);
+  if (!combos.length) {
+    return { steps: [], finalText: null, stopReason: "error", error: "مفيش أي provider متظبط", geminiAttempts: [] };
+  }
 
-async function runAgentLoop(
-  env,
-  rawEventText,
-  eventId,
-  systemInstruction
-) {
-  /*
-   * مصدر الاختيار كله هو AI Router.
-   *
-   * AI_ROUTER_MODEL:
-   *   auto
-   *   gemini/...
-   *   groq/...
-   *
-   * ولو لم يكن موجودًا، الـRouter يستخدم auto.
-   */
-
-  return runAgentLoopWithModel(
-    env,
-    rawEventText,
-    eventId,
-    AI_ROUTER_DEFAULT_MODEL,
-    systemInstruction
-  );
+  // بنجمع محاولات كل الـ providers مع بعض (مش بس آخر واحد) عشان نشوف
+  // السلسلة كاملة في اللوج: Workers AI التلاتة فشلوا ليه، وGemini اتصرف
+  // إزاي بعد كده.
+  const allAttempts = [];
+  let lastResult = null;
+  for (const combo of combos) {
+    const result = await runAgentLoopWithModel(env, rawEventText, combo, eventId, systemInstruction);
+    allAttempts.push(...(result.geminiAttempts || []));
+    if (result.ok) return { ...result, geminiAttempts: allAttempts };
+    lastResult = { ...result, geminiAttempts: allAttempts };
+    const hadRealAction = result.steps.some((s) => s.type === "call");
+    if (hadRealAction) return lastResult;
+  }
+  return lastResult || { steps: [], finalText: null, stopReason: "error", error: "كل الموديلات فشلت", geminiAttempts: allAttempts };
 }
 
 // -----------------------------------------------------------------------------
@@ -1717,7 +863,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       outcome: trace.stopReason,
       finalText: trace.finalText,
       error: trace.error,
-      aiRouterAttempts: trace.aiRouterAttempts,
+      geminiAttempts: trace.geminiAttempts,
       steps: trace.steps,
     };
 
@@ -1840,7 +986,9 @@ async function handleHealth(request, env) {
   const secrets = {
     ZERNIO_API_KEY: !!env.ZERNIO_API_KEY,
     ZERNIO_WEBHOOK_SECRET: !!env.ZERNIO_WEBHOOK_SECRET,
-    AI_ROUTER: true,
+    GEMINI_API_KEY: !!env.GEMINI_API_KEY,
+    CLOUDFLARE_API_TOKEN: !!env.CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ACCOUNT_ID: !!env.CLOUDFLARE_ACCOUNT_ID,
     ADMIN_KEY: !!env.ADMIN_KEY,
   };
 
@@ -2000,7 +1148,7 @@ async function handleGetBusinessContext(request, env) {
 }
 
 // POST /admin/business-context — استبدال يدوي مباشر (body: {"text": "..."}) —
-// من غير أي استدعاء AI، لتحرير نصي سريع.
+// من غير أي معالجة Gemini، لتحرير نصي سريع.
 async function handlePostBusinessContext(request, env) {
   if (!checkAdminKey(request, env)) {
     return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
@@ -2023,241 +1171,47 @@ async function handlePostBusinessContext(request, env) {
 // عشان يرجّع ملخص واحد متجانس محدّث، وده اللي بيتحفظ كسياق جديد.
 async function handleUploadContext(request, env) {
   if (!checkAdminKey(request, env)) {
-    return jsonResponse(
-      {
-        ok: false,
-        error:
-          "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح.",
-      },
-      401
-    );
+    return jsonResponse({ ok: false, error: "Unauthorized. ضيف ?key=... بمفتاح ADMIN_KEY الصحيح." }, 401);
   }
 
   let form;
-
   try {
-    form =
-      await request.formData();
+    form = await request.formData();
   } catch (err) {
-    return jsonResponse(
-      {
-        ok: false,
-
-        error:
-          "الطلب لازم يكون multipart/form-data بحقل file.",
-      },
-      400
-    );
+    return jsonResponse({ ok: false, error: "الطلب لازم يكون multipart/form-data بحقل file." }, 400);
   }
 
-  const files =
-    form
-      .getAll("file")
-      .filter(
-        (f) =>
-          f &&
-          typeof f.text ===
-            "function"
-      );
+  const files = form.getAll("file").filter((f) => f && typeof f.arrayBuffer === "function");
+  if (!files.length) return jsonResponse({ ok: false, error: 'محتاج ملف واحد على الأقل في حقل "file".' }, 400);
+  if (files.length > 2) return jsonResponse({ ok: false, error: "حد أقصى ملفين في المرة الواحدة." }, 400);
 
-
-  if (!files.length) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          'محتاج ملف واحد على الأقل في حقل "file".',
-      },
-      400
-    );
-  }
-
-
-  if (files.length > 2) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          "حد أقصى ملفين في المرة الواحدة.",
-      },
-      400
-    );
-  }
-
-
-  const existing =
-    await kvGetJSON(
-      env,
-      BUSINESS_CONTEXT_KV_KEY
-    );
-
-
-  const existingText =
-    (
-      existing &&
-      existing.text
-    ) ||
-    "";
-
-
-  const extractedFiles =
-    [];
-
-
-  try {
-    for (
-      const file of
-        files
-    ) {
-      const extracted =
-        await extractTextFromUploadedFile(
-          file
-        );
-
-      extractedFiles.push(
-        extracted
-      );
-    }
-  } catch (err) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          err?.message ||
-          String(err),
-      },
-      415
-    );
-  }
-
-
-  let combined =
-    "";
-
-
-  for (
-    const file of
-      extractedFiles
-  ) {
-    combined +=
-      `\n\n===== FILE: ${file.name} =====\n` +
-      file.text;
-  }
-
-
-  /*
-   * حماية من إدخال ملف ضخم جدًا في رسالة واحدة.
-   * الحد هنا لكل ملف بعد الاستخراج النصي.
-   */
-  const MAX_FILE_CHARS =
-    50000;
-
-
-  const safeCombined =
-    combined.slice(
-      0,
-      MAX_FILE_CHARS
-    );
-
+  const existing = await kvGetJSON(env, BUSINESS_CONTEXT_KV_KEY);
+  const existingText = (existing && existing.text) || "";
 
   const instruction =
-    [
-      "إنت مساعد بتلخّص مستندات نشاط تجاري عشان تتحط كسياق لوكيل رد آلي على العملاء عبر الرسائل والتعليقات.",
+    "إنت مساعد بتلخّص مستندات نشاط تجاري عشان تتحط كسياق لوكيل رد آلي على عملاء عبر الرسائل والتعليقات. " +
+    (existingText ? `السياق الحالي المحفوظ فعلاً:\n${existingText}\n\n` : "") +
+    "ادمج السياق الحالي (لو موجود) مع محتوى الملف/الملفات المرفقة في ملخص واحد متجانس بالعربي، مركّز وعملي " +
+    "(الخدمات، الأسعار، السياسات، أسئلة شائعة)، حد أقصى تقريبًا " +
+    BUSINESS_CONTEXT_MAX_WORDS +
+    " كلمة. رجّع النص بس، من غير أي مقدمة أو markdown أو عناوين.";
 
-      existingText
-        ? `السياق الحالي المحفوظ فعلاً:\n${existingText}\n`
-        : "",
-
-      "ادمج السياق الحالي (لو موجود) مع محتوى الملفات في ملخص واحد متجانس بالعربي، مركّز وعملي.",
-
-      "ركّز على الخدمات، الأسعار، السياسات، الشروط، أوقات العمل، طرق التواصل، والأسئلة الشائعة.",
-
-      `الحد الأقصى للملخص تقريبًا ${BUSINESS_CONTEXT_MAX_WORDS} كلمة.`,
-
-      "رجّع النص النهائي فقط، من غير مقدمة أو markdown أو تفسير لطريقة عملك.",
-
-      `محتوى الملفات:\n${safeCombined}`,
-    ]
-      .filter(Boolean)
-      .join(
-        "\n\n"
-      );
-
+  const promptParts = [{ text: instruction }];
+  for (const file of files) {
+    const buf = await file.arrayBuffer();
+    promptParts.push({ inlineData: { mimeType: file.type || "application/octet-stream", data: arrayBufferToBase64(buf) } });
+  }
 
   let summary;
-
-
   try {
-    summary =
-      await callAIRouterForSummary(
-        env,
-        instruction
-      );
+    summary = await callGeminiForSummary(env, promptParts);
   } catch (err) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          String(
-            err?.message ||
-            err
-          ),
-      },
-      502
-    );
+    return jsonResponse({ ok: false, error: String((err && err.message) || err) }, 502);
   }
+  if (!summary) return jsonResponse({ ok: false, error: "Gemini رجّع رد فاضي." }, 502);
 
-
-  if (!summary) {
-    return jsonResponse(
-      {
-        ok:
-          false,
-
-        error:
-          "AI Router رجّع رد فاضي.",
-      },
-      502
-    );
-  }
-
-
-  await kvSetJSON(
-    env,
-    BUSINESS_CONTEXT_KV_KEY,
-    {
-      text:
-        summary,
-
-      updatedAt:
-        isoNow(),
-    }
-  );
-
-
-  return jsonResponse(
-    {
-      ok:
-        true,
-
-      businessContext:
-        summary,
-
-      filesProcessed:
-        files.length,
-
-      aiProvider:
-        "ai-router",
-    }
-  );
+  await kvSetJSON(env, BUSINESS_CONTEXT_KV_KEY, { text: summary, updatedAt: isoNow() });
+  return jsonResponse({ ok: true, businessContext: summary, filesProcessed: files.length });
 }
 
 // -----------------------------------------------------------------------------
