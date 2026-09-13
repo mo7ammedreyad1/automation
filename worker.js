@@ -1079,6 +1079,8 @@ function buildFinalSystemInstruction(businessContextText) {
   return ["── معلومات النشاط التجاري اللي بترد نيابة عنه ──", text, "", AGENT_SYSTEM_INSTRUCTION].join("\n");
 }
 
+
+
 function extractJsonObject(text) {
   if (!text) return null;
   let cleaned = String(text).trim();
@@ -2391,7 +2393,11 @@ export default {
       }
       return;
     }
-
+function getNumberEnv(val, defaultValue) {
+  if (val === undefined || val === null || val === "") return defaultValue;
+  const num = Number(val);
+  return isNaN(num) ? defaultValue : num;
+}
     // الطابور الرئيسي — تأخير متصاعد بين كل محاولة وإعادة المحاولة اللي
     // بعدها (30 ثانية، 60، 120، 240...) عشان لو المشكلة مؤقتة (ازدحام عند
     // موديل معين مثلاً) تاخد وقت تتعافى بدل ما نضرب في نفس الحيط فورًا.
