@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bedaya-gateway-worker",
-  "main": "gateway-worker.js",
+  "main": "worker.js",
   "compatibility_date": "2026-03-01",
   "kv_namespaces": [
     {
