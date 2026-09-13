@@ -63,6 +63,18 @@ const AUTO_CONTEXT_LIMIT = 20;
 // 2) أدوات مساعدة عامة
 // -----------------------------------------------------------------------------
 
+
+function getEnvString(val) {
+  if (typeof val === "string") return val.trim();
+  return "";
+}
+
+function getNumberEnv(val, defaultValue) {
+  if (val === undefined || val === null || val === "") return defaultValue;
+  const num = Number(val);
+  return isNaN(num) ? defaultValue : num;
+}
+
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
@@ -2393,11 +2405,18 @@ export default {
       }
       return;
     }
-function getNumberEnv(val, defaultValue) {
-  if (val === undefined || val === null || val === "") return defaultValue;
-  const num = Number(val);
-  return isNaN(num) ? defaultValue : num;
-}
+
+
+
+
+
+
+
+
+
+
+
+    
     // الطابور الرئيسي — تأخير متصاعد بين كل محاولة وإعادة المحاولة اللي
     // بعدها (30 ثانية، 60، 120، 240...) عشان لو المشكلة مؤقتة (ازدحام عند
     // موديل معين مثلاً) تاخد وقت تتعافى بدل ما نضرب في نفس الحيط فورًا.
