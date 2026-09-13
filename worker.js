@@ -1643,28 +1643,14 @@ async function runAgentLoopWithModel(
   }
 }
 
-
 async function runAgentLoop(
   env,
   rawEventText,
   eventId,
   systemInstruction
 ) {
-  /*
-   * مصدر الاختيار كله هو AI Router.
-   *
-   * AI_ROUTER_MODEL:
-   *   auto
-   *   gemini/...
-   *   groq/...
-   *
-   * ولو لم يكن موجودًا، الـRouter يستخدم auto.
-   */
-
   const model =
-    getEnvString(
-      env.AI_ROUTER_MODEL
-    ) ||
+    (typeof env.AI_ROUTER_MODEL === "string" ? env.AI_ROUTER_MODEL.trim() : "") ||
     AI_ROUTER_DEFAULT_MODEL;
 
   return runAgentLoopWithModel(
@@ -1675,6 +1661,7 @@ async function runAgentLoop(
     systemInstruction
   );
 }
+
 
 // -----------------------------------------------------------------------------
 // 6) معالجة الحدث الوارد
@@ -2404,10 +2391,7 @@ export default {
       }
       return;
     }
-function getEnvString(val) {
-  if (typeof val === "string") return val.trim();
-  return "";
-}
+
     // الطابور الرئيسي — تأخير متصاعد بين كل محاولة وإعادة المحاولة اللي
     // بعدها (30 ثانية، 60، 120، 240...) عشان لو المشكلة مؤقتة (ازدحام عند
     // موديل معين مثلاً) تاخد وقت تتعافى بدل ما نضرب في نفس الحيط فورًا.
