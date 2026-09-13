@@ -1,26 +1,100 @@
 // =============================================================================
-// Zernio Social Inbox Agent — Cloudflare Worker (v9: نشاط تجاري + سياق ديناميكي)
+// Zernio Social Inbox Agent — Cloudflare Worker (v11: connect JSON API + CORS)
 // =============================================================================
 //
-// المعمارية الحالية:
-// - استقبال Zernio Webhooks + التحقق من التوقيع + dedup.
-// - معالجة الأحداث عبر Cloudflare Queues مع Dead Letter Queue وإعادة محاولة.
-// - أدوات Zernio للـDM والتعليقات محفوظة كما هي.
-// - سياق النشاط التجاري محفوظ في KV ويتم دمجه مع الـsystem prompt وقت التشغيل.
-// - طبقة الذكاء الاصطناعي مفصولة في Worker مستقل اسمه ai.
-// - الاتصال بالـAI Router يتم فقط عبر Service Binding باسم AI_ROUTER،
-//   وليس عبر workers.dev أو أي URL عام.
-// - لا توجد داخل هذا الـWorker أي مفاتيح أو اتصالات مباشرة بمزودي النماذج.
+// جديد في v11:
+// - إصلاح باگ: tempToken (توكن فيسبوك الحقيقي EAA...) وconnect_token (توكن
+//   جلسة Zernio) كانوا بيتلخبطوا في بعض. دلوقتي منفصلين طول الوقت.
+// - الـ 3 endpoints بتاعة الربط بقوا JSON API بحت (بدل HTML) + CORS، عشان
+//   الواجهة كلها تبقى جوه ملف الـ HTML اللي عند المستخدم — الـ Worker
+//   ميظهرش في المتصفح خالص غير كنداءات fetch غير مرئية:
+//     GET  /connect/facebook/start?redirect_url=...  → {authUrl}
+//     GET  /connect/facebook/pages?tempToken=...      → {pages:[...]}
+//          (+ هيدر X-Connect-Token)
+//     POST /connect/facebook/select {pageId,...}      → {ok, account}
+//          (+ هيدر X-Connect-Token)
+// - connect.html بقى صفحة واحدة ذكية: تعرض زرار في البداية، ولو رجعت من
+//   فيسبوك (لاقت query params)، تكمل اختيار الصفحة بنفسها من غير أي تنقل.
 //
-// الأسرار المطلوبة:
-//   ZERNIO_API_KEY, ZERNIO_WEBHOOK_SECRET, ADMIN_KEY, STATUS_KEY (اختياري)
+// جديد في v10:
+// - 3 endpoints لربط حسابات فيسبوك عبر OAuth headless بالكامل (واجهة اختيار
+//   الصفحات من عندنا، Zernio بتنفذ الطلبات في الخلفية بس):
+//     GET  /connect/facebook/start     — بيبدأ التدفق، redirect لشاشة فيسبوك
+//     GET  /connect/facebook/callback  — استقبال الرجوع من Zernio + عرض
+//                                         الصفحات المتاحة كأزرار
+//     POST /connect/facebook/select    — إتمام الربط بالصفحة المختارة
+// - محتاج secret جديد: ZERNIO_PROFILE_ID (أو ?profileId= في رابط /start).
+// - ⚠️ أسماء query params الـ callback وشكل جسم POST الاختيار (headless)
+//   غير مؤكدين 100% من التوثيق — الكود بيسجل كل حاجة خام في اللوج عشان
+//   نتأكد ونعدّل بسرعة من أول تجربة حقيقية.
 //
-// Bindings المطلوبة:
-//   ZERNIO_KV       -> KV Namespace
-//   EVENTS_QUEUE    -> Cloudflare Queue producer/consumer
-//   AI_ROUTER       -> Service Binding إلى Worker اسمه ai
+// جديد في v9 (تجهيز المشروع ليكون تجاري):
+// - الـ system prompt بقى جزئين: تعليمات ثابتة في الكود (AGENT_SYSTEM_
+//   INSTRUCTION، بروتوكول/كتالوج الأدوات) + سياق نشاط تجاري ديناميكي محفوظ
+//   في KV (config:business-context)، بيتدمجوا وقت المعالجة عبر
+//   buildFinalSystemInstruction(). التعديل عليه بقى من غير أي deploy جديد.
+// - 3 endpoints جديدة تحت /admin (محمية بمفتاح ADMIN_KEY منفصل عن
+//   STATUS_KEY):
+//     GET  /admin/business-context   — عرض السياق الحالي + الـ prompt الكامل
+//     POST /admin/business-context   — استبدال يدوي مباشر {"text": "..."}
+//     POST /admin/upload-context     — رفع ملف أو اتنين (multipart، حقل
+//                                       file)، بيتبعتوا لـ Gemini (inline
+//                                       PDF/document support) يدمجهم مع
+//                                       السياق الحالي في ملخص واحد (حد
+//                                       أقصى ~500 كلمة) ويحفظه.
+// - ترتيب المحاولة اتعكس: Gemini أولاً (جودة أعلى)، Workers AI احتياطي.
+// - محتاج secret جديد: ADMIN_KEY.
 //
-// ملاحظة: Worker الهدف (ai) لازم يكون منشورًا قبل نشر هذا الـWorker.
+// جديد في v8:
+// - مستهلك منفصل لطابور zernio-events-dlq: بيسجل الرسائل اللي استنفدت كل
+//   محاولاتها في الطابور الرئيسي (بدل ما تفضل غير مرئية في داشبورد
+//   Cloudflare بس) — تحتاج wrangler.jsonc consumer entry إضافي لها (تحت).
+// - تأخير متصاعد بين محاولات إعادة المعالجة (30s, 60s, 120s...).
+// - شيل listComments و deleteComment من كتالوج الموديل في الـ system
+//   prompt (لسه شغالين داخليًا للجلب التلقائي، بس مش خيار للموديل).
+//
+// جديد في v7:
+//
+// 1) إعادة تصميم معمارية الاستقبال: بدل "عالج فورًا في الخلفية" (ctx.waitUntil)
+//    بقينا نستخدم Cloudflare Queues — /webhook/zernio دلوقتي بيحط الحدث في
+//    طابور بس (env.EVENTS_QUEUE.send(...)) ويرجع 200 فورًا. المعالجة الفعلية
+//    بتحصل في دالة queue() منفصلة (المستهلك/consumer). Cloudflare نفسها
+//    بتضمن التسليم: لو المعالجة فشلت (handleZernioEvent رمى استثناء)،
+//    بتعيد المحاولة تلقائيًا (max_retries)، وبعد استنفادها بتحط الرسالة في
+//    Dead Letter Queue بدل ما تضيع خالص — ده كان أهم مطلب.
+//    محتاج تعمل يدويًا قبل النشر:
+//      npx wrangler queues create zernio-events
+//      npx wrangler queues create zernio-events-dlq
+//    وتضيف في wrangler.jsonc:
+//      "queues": {
+//        "producers": [{ "queue": "zernio-events", "binding": "EVENTS_QUEUE" }],
+//        "consumers": [{
+//          "queue": "zernio-events", "max_batch_size": 5, "max_batch_timeout": 5,
+//          "max_retries": 5, "dead_letter_queue": "zernio-events-dlq"
+//        }]
+//      }
+//
+// 2) استبدال @cf/deepseek-ai/deepseek-r1-distill-qwen-32b (موديل تفكير كان
+//    بيدخل في <think> طويل وبيقطع رده قبل ما يوصل لـ JSON خالص، وده كان
+//    السبب الحقيقي وراء عدم الرد على نسبة كبيرة من الرسائل) بـ
+//    @cf/meta/llama-3.2-3b-instruct — موديل مباشر بدون تفكير، أخف وأسرع.
+//
+// 3) إضافة max_tokens=1024 صريح لنداءات Workers AI — القيمة الافتراضية عند
+//    Cloudflare 256 بس، ودي كانت بتساهم في مشكلة القطع في رقم 2.
+//
+// ⚠️ postId في حدث comment.received لازم يكون platformPostId (مش postId/id
+// اللي ممكن يوصلوا فاضيين لو البوست مش منشور من خلال Zernio نفسها).
+//
+// الاستثناء الأمني الوحيد المكتوب في الكود: تجاهل أي حدث صادر من الحساب
+// نفسه (comment.author.isOwnAccount، أو message.direction != incoming).
+//
+// الأسرار المطلوبة (Cloudflare Dashboard أو wrangler secret put):
+//   ZERNIO_API_KEY, ZERNIO_WEBHOOK_SECRET, GEMINI_API_KEY,
+//   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+//   GEMINI_MODELS (اختياري), STATUS_KEY (اختياري)
+//
+// Bindings المطلوبة في wrangler.jsonc: ZERNIO_KV (KV)، EVENTS_QUEUE (Queue
+// producer/consumer زي فوق). الـ "ai" binding القديم اختياري (مش مستخدم).
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -28,10 +102,18 @@
 // -----------------------------------------------------------------------------
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
+const CLOUDFLARE_AI_BASE = "https://api.cloudflare.com/client/v4/accounts";
 
-// مفتاح المصادقة الخاص بالـAI Router — ثابت مؤقتًا حسب طلبك.
-const ROUTER_API_KEY = "reyad-router-2026-super-secret";
 // الترتيب = ترتيب المحاولة الفعلي.
+const WORKERS_AI_MODELS = [
+  "@cf/meta/llama-3.2-3b-instruct",
+  "@cf/meta/llama-3.2-11b-vision-instruct",
+  "@cf/google/gemma-3-12b-it",
+];
+
+const DEFAULT_GEMINI_MODELS = ["gemini-3.1-flash-lite"];
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
 const LOG_LIST_LIMIT = 30;
@@ -40,8 +122,13 @@ const MAX_AGENT_STEPS = 10;
 
 // حد أقصى لوقت أي نداء REST واحد على Zernio.
 const CALL_TIMEOUT_MS = 15000;
-// حد أقصى لوقت نداء واحد للـ AI Router.
+// حد أقصى لوقت نداء موديل واحد (Workers AI عن طريق REST) — أسخى شوية لأن
+// موديلات التفكير (reasoning) ممكن تاخد وقت أطول.
 const AI_CALL_TIMEOUT_MS = 30000;
+
+// حد التوكينز لرد الموديل — الافتراضي عند Cloudflare 256 بس، ده اللي كان
+// بيخلي موديل التفكير القديم يقطع رده في نص الكلام قبل ما يوصل لـ JSON.
+const WORKERS_AI_MAX_TOKENS = 1024;
 
 // كام رسالة/تعليق نجيبهم تلقائيًا كسياق قبل أول دور للموديل.
 const AUTO_CONTEXT_LIMIT = 20;
@@ -346,100 +433,101 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) عميل AI Router — Service Binding
+// 4) عملاء الموديلات (Workers AI عن طريق REST أولاً، Gemini fallback)
 // -----------------------------------------------------------------------------
-//
-// الـ Worker ده لا يتصل بـ Gemini أو Groq مباشرةً.
-// كل استدعاءات الذكاء الاصطناعي تروح للـ Worker الخاص بالـ AI Router
-// من خلال Cloudflare Service Binding باسم AI_ROUTER.
-//
-// ده مهم لأن Service Binding بيستدعي الـ Worker الآخر داخليًا من غير
-// المرور على Internet أو workers.dev URL.
-//
-// الواجهة المتوقعة من AI Router:
-//   POST /v1/chat/completions
-//   POST /v1/summarize
-//
-// الـ client هنا دفاعي ويفهم عدة أشكال شائعة من response عشان مايبقاش
-// معتمد على wrapper واحد فقط.
 
-function extractRouterText(data) {
-  const root = data && typeof data === "object" && "result" in data ? data.result : data;
+function parseCommaList(value) {
+  return (value || "").split(",").map((s) => s.trim()).filter(Boolean);
+}
 
-  if (typeof root === "string") return root;
-  if (!root || typeof root !== "object") return String(root ?? "");
+function buildModelCombos(env) {
+  const combos = [];
 
-  const candidates = [
-    root.text,
-    root.response,
-    root.output_text,
-    root.output,
-    root.content,
-    root.reply,
-    root.answer,
-    root.message && root.message.content,
-    root.result && root.result.response,
-    root.result && root.result.text,
-    root.data && root.data.text,
-    root.data && root.data.response,
-    root.choices && root.choices[0] && root.choices[0].message && root.choices[0].message.content,
-    root.choices && root.choices[0] && root.choices[0].text,
-  ];
+  // Gemini أولاً — جودة أعلى للنشاط التجاري، Workers AI احتياطي مجاني بعده.
+  const geminiKeys = parseCommaList(env.GEMINI_API_KEY);
+  const geminiModels = parseCommaList(env.GEMINI_MODELS);
+  const finalGeminiModels = geminiModels.length ? geminiModels : DEFAULT_GEMINI_MODELS;
+  for (const model of finalGeminiModels) for (const key of geminiKeys) combos.push({ provider: "gemini", model, key });
 
-  for (const value of candidates) {
-    if (typeof value === "string" && value.trim()) return value;
+  for (const model of WORKERS_AI_MODELS) combos.push({ provider: "workers-ai", model });
+
+  return combos;
+}
+
+async function callGeminiTurnFixed(env, contents, systemInstruction, combo, attemptsLog) {
+  const { key, model } = combo;
+  const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      contents,
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      generationConfig: { temperature: 0.3, responseMimeType: "application/json" },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const msg = `Gemini HTTP ${res.status} (${model}): ${errText.slice(0, 300)}`;
+    if (attemptsLog) attemptsLog.push({ provider: "gemini", model, status: res.status, ok: false, note: msg });
+    throw new Error(msg);
   }
 
+  if (attemptsLog) attemptsLog.push({ provider: "gemini", model, status: res.status, ok: true });
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  const parts = (candidate && candidate.content && candidate.content.parts) || [];
+  return parts.map((p) => p.text || "").join("\n");
+}
+
+function contentsToMessages(systemInstruction, contents) {
+  const messages = [{ role: "system", content: systemInstruction }];
+  for (const c of contents) {
+    const text = (c.parts || []).map((p) => p.text || "").join("\n");
+    messages.push({ role: c.role === "model" ? "assistant" : "user", content: text });
+  }
+  return messages;
+}
+
+// دفاعي: أشكال رد مختلفة ممكنة — REST بيلف النتيجة في {result:{...}}.
+function extractWorkersAiText(data) {
+  const inner = data && typeof data === "object" && "result" in data ? data.result : data;
+  if (typeof inner === "string") return inner;
+  if (inner && typeof inner.response === "string") return inner.response;
+  if (inner && inner.result && typeof inner.result.response === "string") return inner.result.response;
+  if (inner && Array.isArray(inner.choices) && inner.choices[0] && inner.choices[0].message) {
+    return inner.choices[0].message.content || "";
+  }
   try {
-    return JSON.stringify(root);
+    return JSON.stringify(inner);
   } catch (_) {
-    return String(root);
+    return String(inner);
   }
 }
 
-async function aiRouterRequest(env, pathname, payload, attemptsLog, operationLabel) {
-  if (!env.AI_ROUTER || typeof env.AI_ROUTER.fetch !== "function") {
-    throw new Error("Service Binding AI_ROUTER مش متظبط على الـ Worker.");
-  }
+async function callWorkersAiTurn(env, contents, systemInstruction, combo, attemptsLog) {
+  const messages = contentsToMessages(systemInstruction, contents);
+  const url = `${CLOUDFLARE_AI_BASE}/${env.CLOUDFLARE_ACCOUNT_ID}/ai/run/${combo.model}`;
 
-  const startedAt = Date.now();
-  const requestUrl = `https://ai-router.internal${pathname}`;
-  let response;
-  let bodyText = "";
-
+  let res, bodyText;
   try {
-    response = await Promise.race([
-      env.AI_ROUTER.fetch(
-        new Request(requestUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${ROUTER_API_KEY}`,
-            "X-AI-Caller": "zernio-social-inbox-agent",
-          },
-          body: JSON.stringify(payload),
-        })
-      ),
+    res = await Promise.race([
+      fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ messages, response_format: { type: "json_object" }, max_tokens: WORKERS_AI_MAX_TOKENS }),
+      }),
       new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`انتهت مهلة AI Router (${AI_CALL_TIMEOUT_MS / 1000}s)`)),
-          AI_CALL_TIMEOUT_MS
-        )
+        setTimeout(() => reject(new Error(`انتهت مهلة نداء Workers AI (${AI_CALL_TIMEOUT_MS / 1000}s)`)), AI_CALL_TIMEOUT_MS)
       ),
     ]);
-
-    bodyText = await response.text();
+    bodyText = await res.text();
   } catch (err) {
-    const msg = `AI Router ${operationLabel} request error: ${(err && err.message) || err}`;
-    if (attemptsLog) {
-      attemptsLog.push({
-        provider: "ai-router",
-        operation: operationLabel,
-        ok: false,
-        durationMs: Date.now() - startedAt,
-        note: msg,
-      });
-    }
+    const msg = `Workers AI REST error (${combo.model}): ${(err && err.message) || err}`;
+    if (attemptsLog) attemptsLog.push({ provider: "workers-ai", model: combo.model, ok: false, note: msg });
     throw new Error(msg);
   }
 
@@ -447,99 +535,66 @@ async function aiRouterRequest(env, pathname, payload, attemptsLog, operationLab
   try {
     data = bodyText ? JSON.parse(bodyText) : {};
   } catch (_) {
-    data = { raw: bodyText.slice(0, 1000) };
+    data = { raw: bodyText.slice(0, 500) };
   }
 
-  if (!response.ok) {
+  if (!res.ok) {
     const errMsg =
       data && Array.isArray(data.errors) && data.errors.length
-        ? data.errors.map((e) => e.message || e.code || e.error).join("; ")
-        : data && data.error
-          ? typeof data.error === "string"
-            ? data.error
-            : JSON.stringify(data.error)
-          : JSON.stringify(data).slice(0, 500);
-
-    const msg = `AI Router HTTP ${response.status} (${operationLabel}): ${errMsg}`;
-    if (attemptsLog) {
-      attemptsLog.push({
-        provider: "ai-router",
-        operation: operationLabel,
-        status: response.status,
-        ok: false,
-        durationMs: Date.now() - startedAt,
-        note: msg,
-      });
-    }
+        ? data.errors.map((e) => e.message || e.code).join("; ")
+        : JSON.stringify(data).slice(0, 300);
+    const msg = `Workers AI REST HTTP ${res.status} (${combo.model}): ${errMsg}`;
+    if (attemptsLog) attemptsLog.push({ provider: "workers-ai", model: combo.model, status: res.status, ok: false, note: msg });
     throw new Error(msg);
   }
 
-  if (attemptsLog) {
-    attemptsLog.push({
-      provider: "ai-router",
-      operation: operationLabel,
-      status: response.status,
-      ok: true,
-      durationMs: Date.now() - startedAt,
-    });
+  if (attemptsLog) attemptsLog.push({ provider: "workers-ai", model: combo.model, status: res.status, ok: true });
+  return extractWorkersAiText(data);
+}
+
+async function callModelTurn(env, contents, systemInstruction, combo, attemptsLog) {
+  if (combo.provider === "workers-ai") return callWorkersAiTurn(env, contents, systemInstruction, combo, attemptsLog);
+  return callGeminiTurnFixed(env, contents, systemInstruction, combo, attemptsLog);
+}
+
+// نداء Gemini منفصل خاص بتلخيص/دمج ملفات سياق النشاط التجاري — رد نصي حر
+// (مش JSON action)، فمش بنستخدم فيه callGeminiTurnFixed العادي.
+async function callGeminiForSummary(env, promptParts) {
+  const keys = parseCommaList(env.GEMINI_API_KEY);
+  if (!keys.length) throw new Error("مفيش GEMINI_API_KEY متظبط");
+  const models = parseCommaList(env.GEMINI_MODELS);
+  const model = models[0] || DEFAULT_GEMINI_MODELS[0];
+
+  const res = await fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": keys[0] },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: promptParts }],
+      generationConfig: { temperature: 0.2 },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Gemini summary HTTP ${res.status}: ${errText.slice(0, 300)}`);
   }
 
-  return data;
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  const parts = (candidate && candidate.content && candidate.content.parts) || [];
+  return parts.map((p) => p.text || "").join("\n").trim();
 }
 
-function contentsToMessages(systemInstruction, contents) {
-  const messages = [{ role: "system", content: systemInstruction }];
-
-  for (const c of contents) {
-    const text = (c.parts || []).map((p) => p.text || "").join("\n");
-    messages.push({ role: c.role === "model" ? "assistant" : "user", content: text });
+// تحويل ArrayBuffer لـ base64 على دفعات — تجنّب تجاوز حد الأرجيومنتس لو
+// الملف كبير نسبيًا.
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
-
-  return messages;
-}
-
-async function callAIRouterTurn(env, contents, systemInstruction, attemptsLog) {
-  const messages = contentsToMessages(systemInstruction, contents);
-
-  const payload = {
-    operation: "chat",
-    systemInstruction,
-    contents,
-    messages,
-    responseFormat: "json",
-    responseMimeType: "application/json",
-    generationConfig: {
-      temperature: 0.3,
-    },
-  };
-
-  const data = await aiRouterRequest(env, "/v1/chat/completions", payload, attemptsLog, "chat");
-  return extractRouterText(data);
-}
-
-async function callAIRouterForSummary(env, promptParts) {
-  const files = promptParts
-    .filter((part) => part && part.inlineData)
-    .map((part) => ({
-      mimeType: part.inlineData.mimeType || "application/octet-stream",
-      data: part.inlineData.data || "",
-    }));
-
-  const data = await aiRouterRequest(
-    env,
-    "/v1/summarize",
-    {
-      operation: "summarize",
-      promptParts,
-      files,
-      responseFormat: "text",
-      temperature: 0.2,
-    },
-    null,
-    "summarize"
-  );
-
-  return extractRouterText(data).trim();
+  return btoa(binary);
 }
 
 // -----------------------------------------------------------------------------
@@ -621,16 +676,17 @@ function extractJsonObject(text) {
   return null;
 }
 
-async function runAgentLoopWithModel(env, rawEventText, eventId, systemInstruction, attemptsLog) {
+async function runAgentLoopWithModel(env, rawEventText, combo, eventId, systemInstruction) {
   const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
   const steps = [];
+  const geminiAttempts = [];
 
   for (let i = 0; i < MAX_AGENT_STEPS; i++) {
     let rawText;
     try {
-      rawText = await callAIRouterTurn(env, contents, systemInstruction, attemptsLog);
+      rawText = await callModelTurn(env, contents, systemInstruction, combo, geminiAttempts);
     } catch (err) {
-      return { ok: false, steps, finalText: null, stopReason: "error", error: err.message };
+      return { ok: false, steps, finalText: null, stopReason: "error", error: err.message, geminiAttempts };
     }
 
     const action = extractJsonObject(rawText);
@@ -648,7 +704,7 @@ async function runAgentLoopWithModel(env, rawEventText, eventId, systemInstructi
     if (action.action === "final") {
       const finalText = typeof action.text === "string" ? action.text : "";
       steps.push({ step: i + 1, ts: isoNow(), type: "final", text: finalText });
-      return { ok: true, steps, finalText, stopReason: "final" };
+      return { ok: true, steps, finalText, stopReason: "final", geminiAttempts };
     }
 
     if (action.action === "call") {
@@ -666,7 +722,6 @@ async function runAgentLoopWithModel(env, rawEventText, eventId, systemInstructi
 
       const results = await executeCalls(env, calls, eventId);
       const allOk = results.length > 0 && results.every((r) => r.ok);
-
       steps.push({
         step: i + 1,
         ts: isoNow(),
@@ -682,7 +737,7 @@ async function runAgentLoopWithModel(env, rawEventText, eventId, systemInstructi
 
       if (action.done === true && allOk) {
         const summary = `تم تلقائيًا (done:true): ${calls.map((c) => c && c.name).join(", ")}`;
-        return { ok: true, steps, finalText: summary, stopReason: "final" };
+        return { ok: true, steps, finalText: summary, stopReason: "final", geminiAttempts };
       }
 
       contents.push({ role: "model", parts: [{ text: rawText }] });
@@ -698,13 +753,29 @@ async function runAgentLoopWithModel(env, rawEventText, eventId, systemInstructi
     });
   }
 
-  return { ok: true, steps, finalText: null, stopReason: "max-steps" };
+  return { ok: true, steps, finalText: null, stopReason: "max-steps", geminiAttempts };
 }
 
 async function runAgentLoop(env, rawEventText, eventId, systemInstruction) {
-  const attempts = [];
-  const result = await runAgentLoopWithModel(env, rawEventText, eventId, systemInstruction, attempts);
-  return { ...result, aiAttempts: attempts };
+  const combos = buildModelCombos(env);
+  if (!combos.length) {
+    return { steps: [], finalText: null, stopReason: "error", error: "مفيش أي provider متظبط", geminiAttempts: [] };
+  }
+
+  // بنجمع محاولات كل الـ providers مع بعض (مش بس آخر واحد) عشان نشوف
+  // السلسلة كاملة في اللوج: Workers AI التلاتة فشلوا ليه، وGemini اتصرف
+  // إزاي بعد كده.
+  const allAttempts = [];
+  let lastResult = null;
+  for (const combo of combos) {
+    const result = await runAgentLoopWithModel(env, rawEventText, combo, eventId, systemInstruction);
+    allAttempts.push(...(result.geminiAttempts || []));
+    if (result.ok) return { ...result, geminiAttempts: allAttempts };
+    lastResult = { ...result, geminiAttempts: allAttempts };
+    const hadRealAction = result.steps.some((s) => s.type === "call");
+    if (hadRealAction) return lastResult;
+  }
+  return lastResult || { steps: [], finalText: null, stopReason: "error", error: "كل الموديلات فشلت", geminiAttempts: allAttempts };
 }
 
 // -----------------------------------------------------------------------------
@@ -818,7 +889,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       outcome: trace.stopReason,
       finalText: trace.finalText,
       error: trace.error,
-      aiAttempts: trace.aiAttempts,
+      geminiAttempts: trace.geminiAttempts,
       steps: trace.steps,
     };
 
@@ -941,8 +1012,11 @@ async function handleHealth(request, env) {
   const secrets = {
     ZERNIO_API_KEY: !!env.ZERNIO_API_KEY,
     ZERNIO_WEBHOOK_SECRET: !!env.ZERNIO_WEBHOOK_SECRET,
-    AI_ROUTER_SERVICE_BINDING: !!env.AI_ROUTER,
+    GEMINI_API_KEY: !!env.GEMINI_API_KEY,
+    CLOUDFLARE_API_TOKEN: !!env.CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ACCOUNT_ID: !!env.CLOUDFLARE_ACCOUNT_ID,
     ADMIN_KEY: !!env.ADMIN_KEY,
+    ZERNIO_PROFILE_ID: !!env.ZERNIO_PROFILE_ID,
   };
 
   let zernioRest = { connected: false };
@@ -1072,19 +1146,116 @@ setInterval(refresh, 5000);
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-// تحويل ArrayBuffer لـ base64 عند رفع ملفات السياق للـ AI Router.
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+// -----------------------------------------------------------------------------
+// 11) ربط حسابات فيسبوك عبر OAuth (JSON API بحت — الواجهة كلها من ملف الـ
+//     HTML اللي على جهاز المستخدم، الـ Worker ميعرضش أي صفحة خالص ولا
+//     يظهر رابطه في المتصفح غير كنداءات fetch مش مرئية)
+// -----------------------------------------------------------------------------
+//
+// ⚠️ إصلاح باگ: tempToken (توكن فيسبوك الحقيقي، بيبدأ بـ EAA) وconnect_token
+// (توكن جلسة Zernio الداخلي) قيمتين منفصلتين تمامًا — الغلطة اللي كانت هنا
+// إنهم اتلخبطوا في بعض. دلوقتي بيوصلوا وبيتبعتوا منفصلين طول الوقت:
+// tempToken في الـ query دايمًا، connect_token في هيدر X-Connect-Token بس.
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, X-Connect-Token",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  };
+}
+
+function corsJson(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() },
+  });
+}
+
+// GET /connect/facebook/start?profileId=...&redirect_url=...
+// بيرجّع {authUrl} بس كـ JSON — الملف اللي عندك (JS) هو اللي بيعمل
+// window.location = authUrl بنفسه. المفتاح السري بتاعنا (ZERNIO_API_KEY)
+// بيتستخدم هنا جوه الـ Worker بس، وميوصلش المتصفح خالص.
+async function handleConnectFacebookStart(request, env) {
+  const url = new URL(request.url);
+  const profileId = url.searchParams.get("profileId") || env.ZERNIO_PROFILE_ID;
+  const redirectUrl = url.searchParams.get("redirect_url");
+
+  if (!profileId) return corsJson({ ok: false, error: "محتاج ZERNIO_PROFILE_ID متظبط كـ secret (أو ?profileId= في الرابط)." }, 400);
+  if (!redirectUrl) return corsJson({ ok: false, error: "محتاج ?redirect_url= يشاور على صفحتك (الملف اللي عندك)." }, 400);
+
+  const qs = new URLSearchParams({ profileId, redirect_url: redirectUrl, headless: "true" });
+  const r = await zernioFetch(env, `/connect/facebook?${qs}`, { method: "GET" });
+  await logActivity(env, { event: "oauth-connect", outcome: "start", timing: { receivedAt: isoNow() }, ok: r.ok, status: r.status, data: r.data });
+
+  if (!r.ok || !r.data || !r.data.authUrl) {
+    return corsJson({ ok: false, error: "فشل الحصول على رابط المصادقة من Zernio.", details: r.data }, 502);
   }
-  return btoa(binary);
+  return corsJson({ ok: true, authUrl: r.data.authUrl });
+}
+
+// GET /connect/facebook/pages?tempToken=...&profileId=... + هيدر
+// X-Connect-Token — بيرجّع {pages:[...]} كـ JSON. الملف بتاعك هو اللي قرا
+// tempToken وconnect_token من رابط الرجوع (query params) وبعتهملنا هنا.
+async function handleConnectFacebookPages(request, env) {
+  const url = new URL(request.url);
+  const tempToken = url.searchParams.get("tempToken");
+  const profileId = url.searchParams.get("profileId") || env.ZERNIO_PROFILE_ID;
+  const connectToken = request.headers.get("X-Connect-Token");
+
+  if (!connectToken) return corsJson({ ok: false, error: "محتاج هيدر X-Connect-Token." }, 400);
+  if (!tempToken) return corsJson({ ok: false, error: "محتاج ?tempToken= (القيمة اللي بتبدأ بـ EAA من رابط الرجوع)." }, 400);
+
+  const qs = new URLSearchParams({ profileId: profileId || "", tempToken });
+  const r = await zernioFetch(env, `/connect/facebook/select-page?${qs}`, {
+    method: "GET",
+    headers: { "X-Connect-Token": connectToken },
+  });
+
+  await logActivity(env, { event: "oauth-connect", outcome: "list-pages", timing: { receivedAt: isoNow() }, ok: r.ok, status: r.status, data: r.data });
+
+  if (!r.ok || !r.data || !Array.isArray(r.data.pages)) {
+    return corsJson({ ok: false, error: "فشل جلب الصفحات من Zernio.", details: r.data }, 502);
+  }
+  return corsJson({ ok: true, pages: r.data.pages });
+}
+
+// POST /connect/facebook/select — body JSON: {pageId, tempToken, profileId}
+// + هيدر X-Connect-Token. بيرجّع {ok, account} كـ JSON.
+async function handleConnectFacebookSelect(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return corsJson({ ok: false, error: "الجسم لازم يكون JSON صالح." }, 400);
+  }
+
+  const connectToken = request.headers.get("X-Connect-Token");
+  const pageId = body.pageId;
+  const tempToken = body.tempToken;
+  const profileId = body.profileId || env.ZERNIO_PROFILE_ID;
+
+  if (!connectToken) return corsJson({ ok: false, error: "محتاج هيدر X-Connect-Token." }, 400);
+  if (!pageId) return corsJson({ ok: false, error: "محتاج pageId في جسم الطلب." }, 400);
+
+  // بنبعت الحقول المعقولة كلها في الـ body — بعض الحقول (زي tempToken هنا)
+  // مش مؤكد 100% إنها مطلوبة في وضع الـ headless تحديدًا، بس وجودها الزيادة
+  // مش متوقع يضر، والرد الخام بيتسجل بالكامل لو محتاج نعدّل.
+  const r = await zernioFetch(env, `/connect/facebook/select-page`, {
+    method: "POST",
+    headers: { "X-Connect-Token": connectToken },
+    body: JSON.stringify({ profileId, pageId, tempToken }),
+  });
+
+  await logActivity(env, { event: "oauth-connect", outcome: "select-page", timing: { receivedAt: isoNow() }, ok: r.ok, status: r.status, data: r.data });
+
+  if (!r.ok) return corsJson({ ok: false, error: "فشل إتمام الربط.", details: r.data }, 502);
+
+  return corsJson({ ok: true, account: (r.data && r.data.account) || r.data });
 }
 
 // -----------------------------------------------------------------------------
-// 11) /admin — إدارة سياق النشاط التجاري (الجزء الديناميكي من الـ system prompt)
+// 12) /admin — إدارة سياق النشاط التجاري (الجزء الديناميكي من الـ system prompt)
 // -----------------------------------------------------------------------------
 //
 // كلهم محميين بـ ADMIN_KEY (منفصل عن STATUS_KEY بتاع الداشبورد للقراءة فقط
@@ -1131,7 +1302,7 @@ async function handlePostBusinessContext(request, env) {
 }
 
 // POST /admin/upload-context — رفع ملف أو اتنين (multipart/form-data، حقل
-// "file" مكرر لو اتنين)، بيتبعتوا للـ AI Router مع السياق الحالي (لو موجود)
+// "file" مكرر لو اتنين)، بيتبعتوا لـ Gemini مع السياق الحالي (لو موجود)
 // عشان يرجّع ملخص واحد متجانس محدّث، وده اللي بيتحفظ كسياق جديد.
 async function handleUploadContext(request, env) {
   if (!checkAdminKey(request, env)) {
@@ -1168,18 +1339,18 @@ async function handleUploadContext(request, env) {
 
   let summary;
   try {
-    summary = await callAIRouterForSummary(env, promptParts);
+    summary = await callGeminiForSummary(env, promptParts);
   } catch (err) {
     return jsonResponse({ ok: false, error: String((err && err.message) || err) }, 502);
   }
-  if (!summary) return jsonResponse({ ok: false, error: "AI Router رجّع رد فاضي." }, 502);
+  if (!summary) return jsonResponse({ ok: false, error: "Gemini رجّع رد فاضي." }, 502);
 
   await kvSetJSON(env, BUSINESS_CONTEXT_KV_KEY, { text: summary, updatedAt: isoNow() });
   return jsonResponse({ ok: true, businessContext: summary, filesProcessed: files.length });
 }
 
 // -----------------------------------------------------------------------------
-// 12) نقطة الدخول الرئيسية
+// 13) نقطة الدخول الرئيسية
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1217,6 +1388,22 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/admin/upload-context") {
         return await handleUploadContext(request, env);
+      }
+
+      if (url.pathname.startsWith("/connect/facebook/") && request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/connect/facebook/start") {
+        return await handleConnectFacebookStart(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/connect/facebook/pages") {
+        return await handleConnectFacebookPages(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/connect/facebook/select") {
+        return await handleConnectFacebookSelect(request, env);
       }
 
       return textResponse("Not found", 404);
