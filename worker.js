@@ -1,6 +1,18 @@
 // =============================================================================
-// Zernio Social Inbox Agent — Cloudflare Worker (v9: نشاط تجاري + سياق ديناميكي)
+// Zernio Social Inbox Agent — Cloudflare Worker (v10: ربط فيسبوك عبر OAuth)
 // =============================================================================
+//
+// جديد في v10:
+// - 3 endpoints لربط حسابات فيسبوك عبر OAuth headless بالكامل (واجهة اختيار
+//   الصفحات من عندنا، Zernio بتنفذ الطلبات في الخلفية بس):
+//     GET  /connect/facebook/start     — بيبدأ التدفق، redirect لشاشة فيسبوك
+//     GET  /connect/facebook/callback  — استقبال الرجوع من Zernio + عرض
+//                                         الصفحات المتاحة كأزرار
+//     POST /connect/facebook/select    — إتمام الربط بالصفحة المختارة
+// - محتاج secret جديد: ZERNIO_PROFILE_ID (أو ?profileId= في رابط /start).
+// - ⚠️ أسماء query params الـ callback وشكل جسم POST الاختيار (headless)
+//   غير مؤكدين 100% من التوثيق — الكود بيسجل كل حاجة خام في اللوج عشان
+//   نتأكد ونعدّل بسرعة من أول تجربة حقيقية.
 //
 // جديد في v9 (تجهيز المشروع ليكون تجاري):
 // - الـ system prompt بقى جزئين: تعليمات ثابتة في الكود (AGENT_SYSTEM_
@@ -990,6 +1002,7 @@ async function handleHealth(request, env) {
     CLOUDFLARE_API_TOKEN: !!env.CLOUDFLARE_API_TOKEN,
     CLOUDFLARE_ACCOUNT_ID: !!env.CLOUDFLARE_ACCOUNT_ID,
     ADMIN_KEY: !!env.ADMIN_KEY,
+    ZERNIO_PROFILE_ID: !!env.ZERNIO_PROFILE_ID,
   };
 
   let zernioRest = { connected: false };
@@ -1120,7 +1133,153 @@ setInterval(refresh, 5000);
 }
 
 // -----------------------------------------------------------------------------
-// 11) /admin — إدارة سياق النشاط التجاري (الجزء الديناميكي من الـ system prompt)
+// 11) ربط حسابات فيسبوك عبر OAuth (headless بالكامل — واجهة اختيار الصفحات
+//     من عندنا، Zernio بتنفذ الطلبات في الخلفية بس)
+// -----------------------------------------------------------------------------
+//
+// ⚠️ نقطتين لسه مش مؤكدتين 100% من التوثيق (هتتضح من أول تجربة حقيقية):
+//   1) أسماء الـ query params اللي Zernio بترجعها على الـ callback لفيسبوك
+//      تحديدًا (التوثيق فيه المثال الكامل لانستجرام بس: profileId, tempToken/
+//      connect_token, platform, step). الكود تحت بيقرا أكتر من احتمال دفاعيًا.
+//   2) شكل جسم POST /connect/facebook/select-page بالظبط في وضع الـ headless
+//      (التوكن مؤكد إنه بيروح في هيدر X-Connect-Token، لكن باقي حقول الـ body
+//      غير مؤكدة بالكامل). بنسجل الرد الخام في اللوج عشان نتأكد ونعدّل بسرعة
+//      لو محتاج.
+
+function escHtmlServer(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function htmlResponse(bodyHtml, status = 200) {
+  return new Response(
+    `<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8" /><title>ربط فيسبوك</title>
+<style>
+  body{font-family:-apple-system,"Segoe UI",Tahoma,sans-serif;background:#0b0e14;color:#d8dee9;padding:24px;max-width:560px;margin:auto;line-height:1.7}
+  button{background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;padding:10px 16px;font-size:14px}
+  button:hover{background:#1d4ed8}
+  pre{background:#171b26;padding:12px;border-radius:6px;overflow:auto;font-size:12px;direction:ltr;text-align:left}
+  form{margin-bottom:8px}
+</style>
+</head><body>${bodyHtml}</body></html>`,
+    { status, headers: { "Content-Type": "text/html; charset=utf-8" } }
+  );
+}
+
+function absoluteUrl(request, path) {
+  const u = new URL(request.url);
+  return `${u.protocol}//${u.host}${path}`;
+}
+
+// GET /connect/facebook/start — بيدّي رابط المصادقة من Zernio ويعمل redirect
+// فوري لمتصفح المستخدم عليه. المفتاح السري بتاعنا (ZERNIO_API_KEY) بيتستخدم
+// هنا بس، جوه الـ Worker، وميوصلش المتصفح خالص.
+async function handleConnectFacebookStart(request, env) {
+  const url = new URL(request.url);
+  const profileId = url.searchParams.get("profileId") || env.ZERNIO_PROFILE_ID;
+  if (!profileId) {
+    return htmlResponse("<h2>محتاج ZERNIO_PROFILE_ID متظبط كـ secret (أو ?profileId= في الرابط).</h2>", 500);
+  }
+
+  const redirectUrl = absoluteUrl(request, "/connect/facebook/callback");
+  const qs = new URLSearchParams({ profileId, redirect_url: redirectUrl, headless: "true" });
+
+  const r = await zernioFetch(env, `/connect/facebook?${qs}`, { method: "GET" });
+  await logActivity(env, { event: "oauth-connect", outcome: "start", timing: { receivedAt: isoNow() }, ok: r.ok, status: r.status });
+
+  if (!r.ok || !r.data || !r.data.authUrl) {
+    return htmlResponse(`<h2>فشل الحصول على رابط المصادقة من Zernio</h2><pre>${escHtmlServer(JSON.stringify(r.data, null, 2))}</pre>`, 502);
+  }
+
+  return Response.redirect(r.data.authUrl, 302);
+}
+
+// GET /connect/facebook/callback — Zernio بترجّع المستخدم هنا بعد موافقته
+// على شاشة فيسبوك. بنجيب قائمة الصفحات المتاحة ونعرضها كأزرار.
+async function handleConnectFacebookCallback(request, env) {
+  const url = new URL(request.url);
+  const params = Object.fromEntries(url.searchParams.entries());
+
+  await logActivity(env, { event: "oauth-connect", outcome: "callback-received", timing: { receivedAt: isoNow() }, params });
+
+  if (params.error) {
+    return htmlResponse(`<h2>فشل الربط</h2><p>الخطأ: ${escHtmlServer(params.error)}</p><pre>${escHtmlServer(JSON.stringify(params, null, 2))}</pre>`);
+  }
+
+  if (params.connected === "facebook" && params.accountId) {
+    return htmlResponse(`<h2>تم الربط بنجاح ✅</h2><p>accountId: ${escHtmlServer(params.accountId)}</p>`);
+  }
+
+  // التوكن ممكن يوصل بأكتر من اسم — بنقرا كل الاحتمالات المعقولة.
+  const connectToken = params.connect_token || params.tempToken || params.token;
+  const profileId = params.profileId || env.ZERNIO_PROFILE_ID;
+
+  if (!connectToken) {
+    return htmlResponse(
+      `<h2>حاجة غريبة وصلت</h2><p>مفيش error ولا accountId ولا أي توكن معروف. دي كل الباراميترز اللي وصلت — محتاجينها نتأكد من الأسماء الصح:</p><pre>${escHtmlServer(JSON.stringify(params, null, 2))}</pre>`
+    );
+  }
+
+  const qs = new URLSearchParams({ profileId: profileId || "", tempToken: connectToken });
+  const r = await zernioFetch(env, `/connect/facebook/select-page?${qs}`, {
+    method: "GET",
+    headers: { "X-Connect-Token": connectToken },
+  });
+
+  await logActivity(env, { event: "oauth-connect", outcome: "list-pages", timing: { receivedAt: isoNow() }, ok: r.ok, status: r.status, data: r.data });
+
+  if (!r.ok || !r.data || !Array.isArray(r.data.pages)) {
+    return htmlResponse(`<h2>فشل جلب الصفحات</h2><pre>${escHtmlServer(JSON.stringify(r.data, null, 2))}</pre>`, 502);
+  }
+
+  const buttons = r.data.pages
+    .map(
+      (p) => `<form method="POST" action="/connect/facebook/select">
+  <input type="hidden" name="connectToken" value="${escHtmlServer(connectToken)}" />
+  <input type="hidden" name="profileId" value="${escHtmlServer(profileId || "")}" />
+  <input type="hidden" name="pageId" value="${escHtmlServer(p.id)}" />
+  <button type="submit">${escHtmlServer(p.name)} (${escHtmlServer(p.category || "")})</button>
+</form>`
+    )
+    .join("");
+
+  return htmlResponse(`<h2>اختار الصفحة اللي عايز تربطها</h2>${buttons || "<p>مفيش صفحات متاحة.</p>"}`);
+}
+
+// POST /connect/facebook/select — استقبال اختيار المستخدم وإتمام الربط فعليًا.
+async function handleConnectFacebookSelect(request, env) {
+  let form;
+  try {
+    form = await request.formData();
+  } catch (err) {
+    return htmlResponse("<h2>طلب غير صالح — لازم يكون form submit.</h2>", 400);
+  }
+
+  const connectToken = form.get("connectToken");
+  const profileId = form.get("profileId") || env.ZERNIO_PROFILE_ID;
+  const pageId = form.get("pageId");
+
+  if (!connectToken || !pageId) {
+    return htmlResponse("<h2>بيانات ناقصة (connectToken أو pageId).</h2>", 400);
+  }
+
+  const r = await zernioFetch(env, `/connect/facebook/select-page`, {
+    method: "POST",
+    headers: { "X-Connect-Token": connectToken },
+    body: JSON.stringify({ profileId, pageId }),
+  });
+
+  await logActivity(env, { event: "oauth-connect", outcome: "select-page", timing: { receivedAt: isoNow() }, ok: r.ok, status: r.status, data: r.data });
+
+  if (!r.ok) {
+    return htmlResponse(`<h2>فشل إتمام الربط</h2><pre>${escHtmlServer(JSON.stringify(r.data, null, 2))}</pre>`, 502);
+  }
+
+  const account = (r.data && r.data.account) || r.data;
+  return htmlResponse(`<h2>تم الربط بنجاح ✅</h2><pre>${escHtmlServer(JSON.stringify(account, null, 2))}</pre>`);
+}
+
+// -----------------------------------------------------------------------------
+// 12) /admin — إدارة سياق النشاط التجاري (الجزء الديناميكي من الـ system prompt)
 // -----------------------------------------------------------------------------
 //
 // كلهم محميين بـ ADMIN_KEY (منفصل عن STATUS_KEY بتاع الداشبورد للقراءة فقط
@@ -1215,7 +1374,7 @@ async function handleUploadContext(request, env) {
 }
 
 // -----------------------------------------------------------------------------
-// 12) نقطة الدخول الرئيسية
+// 13) نقطة الدخول الرئيسية
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1253,6 +1412,18 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/admin/upload-context") {
         return await handleUploadContext(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/connect/facebook/start") {
+        return await handleConnectFacebookStart(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/connect/facebook/callback") {
+        return await handleConnectFacebookCallback(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/connect/facebook/select") {
+        return await handleConnectFacebookSelect(request, env);
       }
 
       return textResponse("Not found", 404);
