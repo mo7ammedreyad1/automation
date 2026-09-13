@@ -390,10 +390,16 @@ function normalizeRouterURL(value) {
 }
 
 function getRouterChatURL(env) {
-  const base = normalizeRouterURL(env.AI_ROUTER_URL);
+  // جلب الرابط وإزالة الأجزاء المكررة أو الزائدة
+  const base = normalizeRouterURL(env.AI_ROUTER_URL || "https://ai.nckalo018.workers.dev");
+  
   if (!base) {
     throw new Error("AI_ROUTER_URL مش متظبط.");
   }
+
+  // إرجاع الرابط مباشرة بدون أي تعديل أو إضافات للمسار
+  return base;
+}
 
   if (base.endsWith("/v1/chat/completions")) {
     return base;
