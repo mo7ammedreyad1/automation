@@ -28,6 +28,9 @@
 // -----------------------------------------------------------------------------
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
+
+// مفتاح المصادقة الخاص بالـAI Router — ثابت مؤقتًا حسب طلبك.
+const ROUTER_API_KEY = "reyad-router-2026-super-secret";
 // الترتيب = ترتيب المحاولة الفعلي.
 const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -409,7 +412,11 @@ async function aiRouterRequest(env, pathname, payload, attemptsLog, operationLab
       env.AI_ROUTER.fetch(
         new Request(requestUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-AI-Caller": "zernio-social-inbox-agent" },
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${ROUTER_API_KEY}`,
+            "X-AI-Caller": "zernio-social-inbox-agent",
+          },
           body: JSON.stringify(payload),
         })
       ),
