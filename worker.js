@@ -354,7 +354,7 @@ async function executeCalls(env, calls, eventId) {
 // المرور على Internet أو workers.dev URL.
 //
 // الواجهة المتوقعة من AI Router:
-//   POST /v1/chat
+//   POST /v1/chat/completions
 //   POST /v1/summarize
 //
 // الـ client هنا دفاعي ويفهم عدة أشكال شائعة من response عشان مايبقاش
@@ -506,7 +506,7 @@ async function callAIRouterTurn(env, contents, systemInstruction, attemptsLog) {
     },
   };
 
-  const data = await aiRouterRequest(env, "/v1/chat", payload, attemptsLog, "chat");
+  const data = await aiRouterRequest(env, "/v1/chat/completions", payload, attemptsLog, "chat");
   return extractRouterText(data);
 }
 
