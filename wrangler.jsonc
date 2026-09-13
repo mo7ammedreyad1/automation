@@ -3,7 +3,7 @@
 
   "name": "zernio-social-inbox-agent",
 
-  "main": "workerv2.js",
+  "main": "worker.js",
 
   "compatibility_date": "2025-06-01",
 
