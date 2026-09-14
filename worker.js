@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Enterprise Social Inbox Agent (v22.0: TikTok + Spam Tool + Factory Reset)
+// Bedaya Enterprise Master Agent (v23.0: Meta, TikTok, WhatsApp & AI Router)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -19,7 +19,7 @@ const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
 const AUTO_CONTEXT_LIMIT = 20;
-const MAX_SAFE_CHARS = 550; // حد أمان لمنع تجاوز 1000 حرف على Meta و TikTok
+const MAX_SAFE_CHARS = 550; // حد أمان قاطع ضد أخطاء طول الرسائل
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -146,7 +146,7 @@ function redactSecret(text, secret) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) كتالوج أدوات الوكيل (Zernio Handlers + أداة تجاهل السبام)
+// 2) كتالوج أدوات الوكيل (Zernio Handlers + أدوات المنصات والسبام)
 // -----------------------------------------------------------------------------
 
 async function zernioFetch(env, path, options = {}) {
@@ -178,16 +178,16 @@ function missingArgsError(names) {
 }
 
 const TOOL_DESCRIPTIONS = {
-  listMessages: "جلب آخر رسائل محادثة DM (سياق)",
-  sendMessage: "إرسال رسالة DM (نص/صورة/فيديو/صوت)",
+  listMessages: "جلب آخر رسائل المحادثة (سياق)",
+  sendMessage: "إرسال رسالة شات (فيسبوك، إنستغرام، تيك توك، واتساب)",
   typingIndicator: "مؤشر الكتابة التلقائي",
-  addReaction: "إضافة تفاعل Reaction على رسالة DM",
-  removeReaction: "إزالة تفاعل Reaction من رسالة DM",
-  listComments: "جلب تعليقات البوست (سياق)",
+  addReaction: "إضافة تفاعل Reaction على رسالة",
+  removeReaction: "إزالة تفاعل Reaction",
+  listComments: "جلب تعليقات البوست أو الفيديو (سياق)",
   replyToComment: "الرد على تعليق (فيسبوك، إنستغرام، تيك توك)",
-  sendPrivateReply: "إرسال DM خاص لصاحب تعليق",
+  sendPrivateReply: "إرسال DM خاص لصاحب تعليق (فيسبوك وإنستغرام)",
   deleteComment: "حذف تعليق",
-  ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام، الإعلانات المزعجة، الإساءة، أو البوتات)",
+  ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام أو الإساءة أو البوتات)",
 };
 
 const CALL_HANDLERS = {
@@ -200,7 +200,7 @@ const CALL_HANDLERS = {
   },
 
   async sendMessage(env, args, idempotencyKey) {
-    const { conversationId, accountId, message, attachmentUrl, attachmentType } = args || {};
+    const { conversationId, accountId, message, attachmentUrl, attachmentType, voiceNote, buttons } = args || {};
     if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
     if (!message && !attachmentUrl) return missingArgsError(["message أو attachmentUrl"]);
     
@@ -211,6 +211,9 @@ const CALL_HANDLERS = {
       body.attachmentUrl = attachmentUrl;
       body.attachmentType = attachmentType || "file";
     }
+    if (voiceNote) body.voiceNote = true;
+    if (buttons) body.buttons = buttons;
+
     const headers = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined;
     return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages`, {
       method: "POST",
@@ -303,7 +306,7 @@ const CALL_HANDLERS = {
     return zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}?${qs}`, { method: "DELETE" });
   },
 
-  // 🛡️ أداة تجاهل السبام والمحادثات المزعجة
+  // أداة درع حماية السبام
   async ignoreMessage(env, args) {
     const { reason = "spam", notes = "" } = args || {};
     return {
@@ -313,7 +316,7 @@ const CALL_HANDLERS = {
         action: "ignored",
         reason,
         notes,
-        message: "تم تجاهل المحادثة وإلغاء الرد بنجاح (Spam/Ignored Action)."
+        message: "تم تجاهل المحادثة بنجاح (Spam Shield Activated)."
       }
     };
   }
@@ -361,7 +364,7 @@ async function executeCalls(env, calls, eventId) {
 // -----------------------------------------------------------------------------
 
 async function buildAgentSystemInstruction(env) {
-  let customPrompt = "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages وعلى التعليقات (فيسبوك، انستجرام، وتيك توك) باحترافية وسرعة.";
+  let customPrompt = "أنت وكيل خدمة عملاء ومبيعات ذكي ومحترف، ترد بلباقة ودقة وسرعة على استفسارات العملاء.";
   let ragSection = "";
 
   if (env.ZERNIO_KV) {
@@ -379,18 +382,18 @@ async function buildAgentSystemInstruction(env) {
     customPrompt,
     ragSection,
     "=== قواعد عمل نظام الوكيل والرد ===",
-    "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات الواردة من Zernio (Instagram, Facebook, TikTok).",
-    "حدثين بس: event = \"message.received\" (رسالة DM) أو event = \"comment.received\" (تعليق على بوست أو فيديو).",
+    "أنت وكيل ذكي للرد على رسائل الـ Direct Messages والتعليقات الواردة من منصات Zernio (WhatsApp, Instagram, Facebook, TikTok).",
+    "حدثين بس: event = \"message.received\" (رسالة DM/WhatsApp) أو event = \"comment.received\" (تعليق على بوست أو فيديو).",
     "",
-    "طريقة الرد الإلزامية: كل رد منك لازم يكون كائن JSON واحد فقط، بدون أي نصوص خارجية أو وسوم تفكير:",
+    "طريقة الرد الإلزامية: كل رد منك لازم يكون كائن JSON واحد فقط بالشكل التالي وبدون وسوم تفكير:",
     '1) {"action": "call", "calls": [{"name": "اسم العملية", "args": {...}}], "done": true}',
     '2) {"action": "final", "text": "..."}',
     "",
     "قواعد صارمة جداً:",
-    "1. الحد الأقصى لنص message في sendMessage أو replyToComment هو 300 حرف فقط لتفادي قيود Meta و TikTok.",
-    "2. في حالة وصول رسالة سبام، إعلانات احتيالية، إساءة، أو بوتات مكررة: استخدم أداة ignoreMessage مع done:true فوراً لعدم إرسال أي رد للعميل.",
+    "1. الحد الأقصى لنص message في sendMessage أو replyToComment هو 300 حرف فقط لتفادي قيود المنصات.",
+    "2. في حالة وصول رسالة سبام، إعلانات وهمية، إساءة، أو بوتات: استخدم أداة ignoreMessage مع done:true فوراً لعدم إرسال أي رد للعميل.",
     "",
-    "── كتالوج أدوات الـ DM (event = message.received) ──",
+    "── كتالوج أدوات الـ DM والشات (event = message.received) ──",
     '- sendMessage — args: { conversationId, accountId, message (نص عربي < 300 حرف), attachmentUrl? }',
     '- addReaction — args: { conversationId, accountId, messageId, emoji }',
     '- removeReaction — args: { conversationId, accountId, messageId }',
@@ -399,7 +402,7 @@ async function buildAgentSystemInstruction(env) {
     "",
     "── كتالوج التعليقات (event = comment.received) ──",
     '- replyToComment — args: { postId (platformPostId!), accountId, message, attachmentUrl?, commentId? }',
-    '- sendPrivateReply — args: { postId (platformPostId!), commentId, accountId, message }',
+    '- sendPrivateReply — args: { postId (platformPostId!), commentId, accountId, message } (فيسبوك وإنستغرام بس)',
     '- ignoreMessage — args: { reason ("spam"|"offensive"|"no_action_needed"), notes? }',
     "",
     "طريقة عملك:",
@@ -615,7 +618,7 @@ async function runAgentLoop(env, rawEventText, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) معالجة الأحداث الواردة (Webhook Events)
+// 6) معالجة الأحداث الواردة (Incoming Webhooks)
 // -----------------------------------------------------------------------------
 
 function isSelfEcho(payload) {
@@ -693,7 +696,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
         contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
         rawEventText += `\n\nسياق آخر الرسائل (مرفقة تلقائياً):\n${JSON.stringify(history.data).slice(0, 3000)}`;
       } else {
-        contextFetched = { type: "messages", error: "extractMessageContext فشل في استخراج المعرفات" };
+        contextFetched = { type: "messages", error: "فشل استخراج معرفات المحادثة" };
       }
     } else if (eventType === "comment.received") {
       const ids = extractCommentContext(payload);
@@ -702,7 +705,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
         contextFetched = { type: "comments", ids, ok: history.ok, status: history.status, data: history.data };
         rawEventText += `\n\nسياق تعليقات البوست:\n${JSON.stringify(history.data).slice(0, 3000)}`;
       } else {
-        contextFetched = { type: "comments", error: "extractCommentContext فشل في استخراج المعرفات" };
+        contextFetched = { type: "comments", error: "فشل استخراج معرفات التعليق" };
       }
     }
 
@@ -758,7 +761,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 7) مسارات الـ API (المصادقة، الحسابات، الإحصائيات، الفرمتة الشاملة، والـ RAG)
+// 7) مسارات الـ API (المصادقة، الحسابات، الإحصائيات، الفرمتة، الـ RAG، والواتساب)
 // -----------------------------------------------------------------------------
 
 async function handleApiRequests(request, env, url) {
@@ -798,11 +801,11 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. 🧹 الفرمتة الشاملة للسيرفر وحذف جميع الحسابات والبيانات (Factory Reset)
+  // 4. 🧹 الفرمتة الشاملة للسيرفر (Factory Reset API)
   if (method === 'POST' && path === '/api/admin/factory-reset') {
     const disconnectedAccounts = [];
 
-    // أ. جلب وفصل جميع الحسابات من Zernio
+    // أ. فصل جميع الحسابات من Zernio
     try {
       const accRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
       const accounts = Array.isArray(accRes.data) ? accRes.data : (accRes.data?.accounts || []);
@@ -837,7 +840,7 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      message: "تمت فرمتة السيرفر وحذف جميع الحسابات والبيانات بالكامل وإعادته لحالة المصنع.",
+      message: "تمت فرمتة السيرفر وحذف جميع الحسابات وبيانات الـ KV بالكامل وإعادته لحالة المصنع.",
       deletedAccountsCount: disconnectedAccounts.length,
       disconnectedAccounts,
       deletedKvKeysCount: deletedKeysCount,
@@ -845,7 +848,7 @@ async function handleApiRequests(request, env, url) {
     });
   }
 
-  // 5. تفويض فيسبوك
+  // 5. مسارات تفويض فيسبوك
   if (method === 'GET' && path === '/api/auth/facebook') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -853,7 +856,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 6. جلب صفحات فيسبوك الرسمية
   if (method === 'GET' && path === '/api/auth/facebook/pages') {
     const tempToken = url.searchParams.get('tempToken');
     const connectToken = url.searchParams.get('connect_token') || request.headers.get('x-connect-token') || '';
@@ -867,7 +869,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 7. تأكيد ربط صفحة فيسبوك
   if (method === 'POST' && path === '/api/auth/facebook/select') {
     const body = await request.json().catch(() => ({}));
     body.profileId = PROFILE_ID;
@@ -879,7 +880,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 8. تفويض إنستغرام
+  // 6. مسارات تفويض إنستغرام
   if (method === 'GET' && path === '/api/auth/instagram') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
@@ -888,7 +889,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 9. جلب حسابات إنستغرام
   if (method === 'GET' && path === '/api/auth/instagram/accounts') {
     const tempToken = url.searchParams.get('tempToken');
     const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${PROFILE_ID}&tempToken=${tempToken}`;
@@ -896,7 +896,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 10. تأكيد ربط حساب إنستغرام
   if (method === 'POST' && path === '/api/auth/instagram/select') {
     const body = await request.json().catch(() => ({}));
     body.profileId = PROFILE_ID;
@@ -908,7 +907,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 11. 🎵 تفويض وربط حساب TikTok الرسمي
+  // 7. تفويض TikTok الرسمي
   if (method === 'GET' && path === '/api/auth/tiktok') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/tiktok?profileId=${PROFILE_ID}&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -916,7 +915,36 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 12. حفظ واسترجاع الـ System Prompt
+  // 8. 🟢 تفويض WhatsApp الرسمي (Cloud API & Coexistence)
+  if (method === 'GET' && path === '/api/auth/whatsapp') {
+    const redirectUrl = url.searchParams.get('redirect_url') || '';
+    const onboarding = url.searchParams.get('onboarding') || 'api'; // 'api' (Cloud API) or 'business_app' (QR Coexistence)
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/whatsapp?profileId=${PROFILE_ID}&onboarding=${onboarding}&signup=hosted&redirect_url=${encodeURIComponent(redirectUrl)}`;
+    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${API_KEY}` } });
+    return jsonResponse(await res.json().catch(() => ({})), res.status);
+  }
+
+  if (method === 'GET' && path === '/api/auth/whatsapp/numbers') {
+    const tempToken = url.searchParams.get('tempToken');
+    if (!tempToken) return jsonResponse({ error: 'tempToken مطلوب' }, 400);
+
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/whatsapp/select-phone-number?profileId=${PROFILE_ID}&tempToken=${encodeURIComponent(tempToken)}`;
+    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${API_KEY}` } });
+    return jsonResponse(await res.json().catch(() => ({})), res.status);
+  }
+
+  if (method === 'POST' && path === '/api/auth/whatsapp/select') {
+    const body = await request.json().catch(() => ({}));
+    body.profileId = PROFILE_ID;
+    const res = await fetch(`${ZERNIO_API_BASE}/connect/whatsapp/select-phone-number`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    return jsonResponse(await res.json().catch(() => ({})), res.status);
+  }
+
+  // 9. إدارة الـ System Prompt
   if (method === 'POST' && path === '/api/set-prompt') {
     const body = await request.json().catch(() => ({}));
     if (!body.prompt) return jsonResponse({ error: 'حقل prompt مفقود' }, 400);
@@ -929,7 +957,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 13. رفع وحذف مستند الـ RAG
+  // 10. إدارة نصوص مستندات الـ RAG
   if (method === 'POST' && path === '/api/upload-rag-doc') {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
@@ -950,7 +978,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح قاعدة المعرفة بنجاح' });
   }
 
-  // 14. نظرة عامة للأدمن
+  // 11. نظرة عامة للأدمن
   if (method === 'GET' && path === '/api/admin/overview') {
     const prompt = env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null;
     const ragMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_meta') : null;
@@ -958,8 +986,9 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      service: "Bedaya Enterprise Agent Engine v22.0",
+      service: "Bedaya Enterprise Master Agent v23.0",
       model: AI_ROUTER_MODEL,
+      platforms: ["Facebook", "Instagram", "TikTok", "WhatsApp"],
       prompt: prompt || 'البرومبت الافتراضي نشط',
       rag: {
         active: !!ragContent,
@@ -969,19 +998,19 @@ async function handleApiRequests(request, env, url) {
     });
   }
 
-  // 15. سجل تتبع الـ 3 أيام للوحة التحكم
+  // 12. سجل تتبع الـ 3 أيام للوحة التحكم
   if (method === 'GET' && path === '/api/audit-logs') {
     const logs = await listRecentLogs(env, { limit: 50 });
     return jsonResponse({ ok: true, count: logs.length, logs });
   }
 
-  // 16. محاكاة الشات المباشر مع اختبار أداة تجاهل السبام
+  // 13. محاكاة واختبار الشات المباشر
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار المتاحة؟';
     const fakeEventText = JSON.stringify({
       event: "message.received",
-      account: { id: "test_account", platform: "instagram" },
+      account: { id: "test_account", platform: "whatsapp" },
       message: { id: "sim_msg", conversationId: "sim_conv", text: userMessage }
     });
 
@@ -990,7 +1019,7 @@ async function handleApiRequests(request, env, url) {
       const lastCall = result.steps?.find(s => s.type === 'call')?.calls?.[0];
       return jsonResponse({
         ok: true,
-        generatedReply: lastCall?.args?.message || result.finalText || (lastCall?.name === 'ignoreMessage' ? 'تم تجاهل الرسالة (Spam Detected)' : 'تم تنفيذ الأداة بنجاح'),
+        generatedReply: lastCall?.args?.message || result.finalText || (lastCall?.name === 'ignoreMessage' ? 'تم تجاهل الرسالة (Spam Shield)' : 'تم تنفيذ الأداة بنجاح'),
         executedTool: lastCall?.name || 'none',
         toolArgs: lastCall?.args || {},
         steps: result.steps
@@ -1125,7 +1154,7 @@ async function handleDashboard(request, env) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>لوحة متابعة Zernio Agent v22</title>
+<title>لوحة متابعة Zernio Agent v23</title>
 <style>
   body { background:#0b0e14; color:#d8dee9; font-family: -apple-system, Tahoma, sans-serif; margin:0; padding:16px; }
   h1 { font-size:16px; color:#8fd3ff; margin:0 0 8px; }
@@ -1142,7 +1171,7 @@ async function handleDashboard(request, env) {
 </style>
 </head>
 <body>
-<h1>لوحة متابعة Zernio Social Inbox Agent (v22.0)</h1>
+<h1>لوحة متابعة Zernio Social Inbox Agent (v23.0)</h1>
 <div id="status">بيحمل...</div>
 <div class="bar" id="bar"></div>
 <div id="logs"></div>
@@ -1233,6 +1262,7 @@ export default {
   },
 
   async queue(batch, env) {
+    // معالجة طابور الـ Dead Letter Queue (DLQ)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
         const { payload, receivedAt } = message.body || {};
@@ -1248,6 +1278,7 @@ export default {
       return;
     }
 
+    // معالجة الطابور الرئيسي مع التأخير التصاعدي
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
