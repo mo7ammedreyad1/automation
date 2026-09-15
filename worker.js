@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Enterprise Master Agent (v25.0: Multi-Tenant Pooling & Stealth Hub)
+// Bedaya Enterprise Master Engine (v25.0: Multi-Tenant Pool & Dynamic Connect)
 // =============================================================================
 
 const DEFAULT_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -19,12 +19,12 @@ const MAX_AGENT_STEPS = 10;
 const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
-const AUTO_CONTEXT_LIMIT = 10; // سياق 10 رسائل لسرعة الاستجابة
+const AUTO_CONTEXT_LIMIT = 10; // سياق 10 رسائل للسرعة الفائقة
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token, X-Admin-Key, X-Tenant-Id',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token, X-Admin-Key, X-Client-Token',
 };
 
 // -----------------------------------------------------------------------------
@@ -129,59 +129,101 @@ function redactSecret(text, secret) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) محرك الـ Multi-Tenant والتوجيه الذكي للمتاجر والفتحات (Tenant Router)
+// 2) محرك مستودع الحسابات المجهول وتأجير الفتحات الذكي (Zernio Pool Allocator)
 // -----------------------------------------------------------------------------
 
-async function resolveTenantContext(env, accountId, tenantIdOverride = null) {
-  // 1. البحث في جدول التوجيه العكسي O(1) بواسطة accountId
-  if (accountId && env.ZERNIO_KV) {
-    const reverse = await kvGetJSON(env, `account_to_tenant:${accountId}`);
-    if (reverse) {
-      const tenant = await kvGetJSON(env, `tenant:${reverse.tenantId}`);
-      if (tenant) {
-        return {
-          tenantId: reverse.tenantId,
-          apiKey: reverse.apiKey || tenant.apiKey || env.ZERNIO_API_KEY || DEFAULT_ZERNIO_API_KEY,
-          profileId: reverse.profileId || tenant.profileId || env.ZERNIO_PROFILE_ID || DEFAULT_ZERNIO_PROFILE_ID,
-          prompt: tenant.prompt || null,
-          filesContent: tenant.filesContent || null,
-          crmSchema: tenant.crmSchema || null,
-          tenantName: tenant.name || reverse.tenantId
-        };
-      }
-    }
+// جلب قائمة مستودعات الحسابات
+async function getZernioPools(env) {
+  if (!env.ZERNIO_KV) return [];
+  const pools = await kvGetJSON(env, "zernio_pools_list");
+  if (Array.isArray(pools) && pools.length > 0) return pools;
+
+  // مستودع افتراضي أولي
+  return [{
+    poolId: "pool_default",
+    apiKey: (env.ZERNIO_API_KEY || DEFAULT_ZERNIO_API_KEY).trim(),
+    profileId: (env.ZERNIO_PROFILE_ID || DEFAULT_ZERNIO_PROFILE_ID).trim(),
+    maxSlots: 2,
+    usedSlots: 0,
+    note: "المستودع الافتراضي الأولي"
+  }];
+}
+
+async function saveZernioPools(env, pools) {
+  if (env.ZERNIO_KV) await kvSetJSON(env, "zernio_pools_list", pools);
+}
+
+// البحث عن فتحة شاغرة في المستودع وتأجيرها للعميل
+async function allocateAvailablePoolSlot(env) {
+  const pools = await getZernioPools(env);
+  const availablePool = pools.find(p => (p.usedSlots || 0) < (p.maxSlots || 2));
+
+  if (!availablePool) {
+    throw new Error("جميع فتحات مستودع Zernio ممتلئة حالياً. يرجى إضافة حساب Zernio جديد من لوحة الآدمن.");
   }
 
-  // 2. البحث بواسطة tenantId الصريح من الطلب
-  if (tenantIdOverride && env.ZERNIO_KV) {
-    const tenant = await kvGetJSON(env, `tenant:${tenantIdOverride}`);
-    if (tenant) {
+  return {
+    pool: availablePool,
+    confirmAllocation: async () => {
+      availablePool.usedSlots = (availablePool.usedSlots || 0) + 1;
+      await saveZernioPools(env, pools);
+    }
+  };
+}
+
+// تحرير فتحة عند حذف حساب أو فصله
+async function releasePoolSlot(env, poolId) {
+  const pools = await getZernioPools(env);
+  const target = pools.find(p => p.poolId === poolId);
+  if (target && target.usedSlots > 0) {
+    target.usedSlots -= 1;
+    await saveZernioPools(env, pools);
+  }
+}
+
+// حل ومعرفة هوية العميل والبيانات من خلال token أو accountId (O(1) Reverse Lookup)
+async function resolveClientScope(env, clientToken = null, accountId = null) {
+  // 1. التوجيه من خلال accountId عند وصول الـ Webhook
+  if (accountId && env.ZERNIO_KV) {
+    const map = await kvGetJSON(env, `account_map:${accountId}`);
+    if (map && map.clientToken) {
+      const client = await kvGetJSON(env, `client:${map.clientToken}`);
       return {
-        tenantId: tenantIdOverride,
-        apiKey: tenant.apiKey || env.ZERNIO_API_KEY || DEFAULT_ZERNIO_API_KEY,
-        profileId: tenant.profileId || env.ZERNIO_PROFILE_ID || DEFAULT_ZERNIO_PROFILE_ID,
-        prompt: tenant.prompt || null,
-        filesContent: tenant.filesContent || null,
-        crmSchema: tenant.crmSchema || null,
-        tenantName: tenant.name || tenantIdOverride
+        clientToken: map.clientToken,
+        client: client || { name: map.clientToken },
+        apiKey: map.apiKey || DEFAULT_ZERNIO_API_KEY,
+        profileId: map.profileId || DEFAULT_ZERNIO_PROFILE_ID,
+        poolId: map.poolId || "pool_default"
       };
     }
   }
 
-  // 3. الإعدادات الافتراضية العامة للسيرفر (Fallback)
+  // 2. التوجيه من خلال كود العميل الصريح (Client Token)
+  if (clientToken && env.ZERNIO_KV) {
+    const client = await kvGetJSON(env, `client:${clientToken}`);
+    if (client) {
+      return {
+        clientToken,
+        client,
+        apiKey: client.lastApiKey || DEFAULT_ZERNIO_API_KEY,
+        profileId: client.lastProfileId || DEFAULT_ZERNIO_PROFILE_ID,
+        poolId: null
+      };
+    }
+  }
+
+  // 3. Fallback عام
   return {
-    tenantId: "default",
+    clientToken: "default",
+    client: { name: "العميل الافتراضي", maxAccounts: 10, connectedAccounts: [] },
     apiKey: (env.ZERNIO_API_KEY || DEFAULT_ZERNIO_API_KEY).trim(),
     profileId: (env.ZERNIO_PROFILE_ID || DEFAULT_ZERNIO_PROFILE_ID).trim(),
-    prompt: null,
-    filesContent: null,
-    crmSchema: null,
-    tenantName: "المتجر الافتراضي"
+    poolId: "pool_default"
   };
 }
 
 // -----------------------------------------------------------------------------
-// 3) كتالوج أدوات الوكيل (Zernio Tool Handlers + Custom CRM + Spam Tool)
+// 3) الاتصال بـ Zernio API وكتالوج أدوات الوكيل
 // -----------------------------------------------------------------------------
 
 async function zernioFetch(env, path, options = {}, contextApiKey = null) {
@@ -347,16 +389,16 @@ const CALL_HANDLERS = {
     };
   },
 
-  async saveToCrm(env, args, idempotencyKey, contextApiKey, tenantId = "default") {
+  async saveToCrm(env, args, idempotencyKey, contextApiKey, clientToken = "default") {
     const { leadData = {} } = args || {};
     if (env.ZERNIO_KV) {
-      const leadId = `crm_lead:${tenantId}:${isoNow()}:${shortId()}`;
-      await kvSetJSON(env, leadId, { ...leadData, tenantId, createdAt: isoNow() }, 60 * 24 * 60 * 60);
+      const leadId = `crm_lead:${clientToken}:${isoNow()}:${shortId()}`;
+      await kvSetJSON(env, leadId, { ...leadData, clientToken, createdAt: isoNow() }, 60 * 24 * 60 * 60);
     }
     return {
       ok: true,
       status: 200,
-      data: { action: "saved_to_crm", leadData, message: "تم تسجيل بيانات العميل بنجاح في الـ CRM." }
+      data: { action: "saved_to_crm", leadData, message: "تم تسجيل وحفظ بيانات العميل في الـ CRM بنجاح." }
     };
   }
 };
@@ -373,7 +415,7 @@ async function buildIdempotencyKey(eventId, name, args) {
   return bufferToHex(buf).slice(0, 40);
 }
 
-async function executeCalls(env, calls, eventId, contextApiKey, tenantId) {
+async function executeCalls(env, calls, eventId, contextApiKey, clientToken) {
   const results = [];
   for (const c of calls) {
     const name = c && c.name;
@@ -388,7 +430,7 @@ async function executeCalls(env, calls, eventId, contextApiKey, tenantId) {
     }
     try {
       const idempotencyKey = IDEMPOTENT_WRITE_OPS.has(name) ? await buildIdempotencyKey(eventId, name, c.args) : undefined;
-      const r = await handler(env, c.args || {}, idempotencyKey, contextApiKey, tenantId);
+      const r = await handler(env, c.args || {}, idempotencyKey, contextApiKey, clientToken);
       results.push({ name, ok: r.ok, status: r.status, data: r.data });
     } catch (err) {
       results.push({ name, ok: false, data: { error: redactSecret(String((err && err.message) || err), contextApiKey) } });
@@ -398,28 +440,29 @@ async function executeCalls(env, calls, eventId, contextApiKey, tenantId) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) بناء الـ System Prompt الديناميكي الخاص بالمتجر
+// 4) بناء الـ System Prompt الديناميكي الخاص بالعميل
 // -----------------------------------------------------------------------------
 
-async function buildAgentSystemInstruction(env, tenantCtx) {
-  let customPrompt = tenantCtx.prompt;
+async function buildAgentSystemInstruction(env, clientScope) {
+  const client = clientScope.client || {};
+  let customPrompt = client.prompt;
   let filesSection = "";
   let crmSection = "";
 
   if (!customPrompt && env.ZERNIO_KV) {
     customPrompt = await env.ZERNIO_KV.get("custom_agent_prompt").catch(() => null);
   }
-  if (!customPrompt) customPrompt = `أنت المساعد الذكي لـ (${tenantCtx.tenantName})، ترد بلباقة واحترافية وسرعة.`;
+  if (!customPrompt) customPrompt = `أنت المساعد الذكي لـ (${client.name || 'المتجر'})، ترد بلباقة واحترافية وسرعة.`;
 
-  let analyzedFiles = tenantCtx.filesContent;
+  let analyzedFiles = client.filesContent;
   if (!analyzedFiles && env.ZERNIO_KV) {
     analyzedFiles = await env.ZERNIO_KV.get("store_files_content").catch(() => null);
   }
   if (analyzedFiles && analyzedFiles.trim()) {
-    filesSection = `\n=== ملفات ومعرفة المتجر (Store Knowledge) ===\nاستند بدقة للتفاصيل التالية:\n${analyzedFiles.trim()}\n`;
+    filesSection = `\n=== ملفات ومعرفة المتجر المستخرجة (Store Knowledge) ===\nاستند بدقة للتفاصيل التالية:\n${analyzedFiles.trim()}\n`;
   }
 
-  let crmSchema = tenantCtx.crmSchema;
+  let crmSchema = client.crmSchema;
   if (!crmSchema && env.ZERNIO_KV) {
     crmSchema = await env.ZERNIO_KV.get("crm_custom_schema").catch(() => null);
   }
@@ -433,7 +476,7 @@ async function buildAgentSystemInstruction(env, tenantCtx) {
     filesSection,
     crmSection,
     "=== قواعد عمل نظام الوكيل والرد ===",
-    "أنت وكيل ذكي بيرد على رسائل الـ DMs والتعليقات الواردة من Zernio (Instagram, Facebook, TikTok).",
+    "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات الواردة من Zernio (Instagram, Facebook, TikTok).",
     "حدثين بس: event = \"message.received\" أو event = \"comment.received\".",
     "",
     "طريقة الرد الإلزامية: كل رد منك لازم يكون كائن JSON واحد فقط:",
@@ -441,7 +484,7 @@ async function buildAgentSystemInstruction(env, tenantCtx) {
     '2) {"action": "final", "text": "..."}',
     "",
     "القواعد:",
-    "1. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
+    "1. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة أو تكرار عشوائي: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
     "2. عند إتمام اتفاق أو طلب مع العميل وجمع بياناته: استخدم أداة saveToCrm لتسجيل البيانات في الـ CRM.",
     "",
     "── كتالوج أدوات الـ DM (event = message.received) ──",
@@ -582,7 +625,6 @@ ${rawFileText.slice(0, 15000)}
   const data = await res.json();
   const synthesized = extractRouterText(data).trim();
 
-  // فحص صارم: التأكد أن الرد صالح ومحتوٍ على معلومات حقيقية
   if (!synthesized || synthesized.length < 25 || synthesized.toLowerCase().includes("undefined")) {
     throw new Error("فشل الذكاء الاصطناعي في استخراج ملخص صالح للملف.");
   }
@@ -617,8 +659,8 @@ function extractJsonObject(text) {
 // 6) حلقة تفكير الوكيل (ReAct Agent Loop)
 // -----------------------------------------------------------------------------
 
-async function runAgentLoopWithModel(env, rawEventText, eventId, tenantCtx) {
-  const systemInstruction = await buildAgentSystemInstruction(env, tenantCtx);
+async function runAgentLoopWithModel(env, rawEventText, eventId, clientScope) {
+  const systemInstruction = await buildAgentSystemInstruction(env, clientScope);
   const contents = [{ role: "user", parts: [{ text: rawEventText }] }];
   const steps = [];
   const routerAttempts = [];
@@ -662,8 +704,8 @@ async function runAgentLoopWithModel(env, rawEventText, eventId, tenantCtx) {
         continue;
       }
 
-      // تمرير الـ API Key والمفتاح المخصص لهذا المتجر بعينه!
-      const results = await executeCalls(env, calls, eventId, tenantCtx.apiKey, tenantCtx.tenantId);
+      // تمرير الـ API Key المناسب للحساب عبر clientScope
+      const results = await executeCalls(env, calls, eventId, clientScope.apiKey, clientScope.clientToken);
       const allOk = results.length > 0 && results.every((r) => r.ok);
       steps.push({
         step: i + 1,
@@ -699,16 +741,16 @@ async function runAgentLoopWithModel(env, rawEventText, eventId, tenantCtx) {
   return { ok: true, steps, finalText: null, stopReason: "max-steps", routerAttempts };
 }
 
-async function runAgentLoop(env, rawEventText, eventId, tenantCtx) {
+async function runAgentLoop(env, rawEventText, eventId, clientScope) {
   const apiKey = env.AI_ROUTER_API_KEY || env.GEMINI_API_KEY || DEFAULT_ZERNIO_API_KEY;
   if (!apiKey) {
     return { steps: [], finalText: null, stopReason: "error", error: "مفيش AI_ROUTER_API_KEY متظبط بالسيرفر", routerAttempts: [] };
   }
-  return runAgentLoopWithModel(env, rawEventText, eventId, tenantCtx);
+  return runAgentLoopWithModel(env, rawEventText, eventId, clientScope);
 }
 
 // -----------------------------------------------------------------------------
-// 7) معالجة أحداث الويب هوك وتوجيه المتاجر التلقائي
+// 7) معالجة أحداث الويب هوك وتوجيه الرسائل العكسي (O(1) Reverse Ingestion)
 // -----------------------------------------------------------------------------
 
 function isSelfEcho(payload) {
@@ -750,8 +792,8 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
   const trigger = buildTriggerPreview(payload, rawBody);
   const accountId = extractAccountId(payload);
 
-  // 🎯 استدعاء هوية المتجر والفتحة المخصصة لهذا الحساب بعينه!
-  const tenantCtx = await resolveTenantContext(env, accountId);
+  // البحث العكسي في الـ KV لمعرفة العميل والمفتاح المخصص لهذا الـ accountId
+  const clientScope = await resolveClientScope(env, null, accountId);
 
   try {
     if (isSelfEcho(payload)) {
@@ -759,7 +801,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       await logActivity(env, {
         eventId,
         event: eventType,
-        tenantId: tenantCtx.tenantId,
+        clientToken: clientScope.clientToken,
         trigger,
         timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
         outcome: "skipped-self-echo",
@@ -772,7 +814,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       await logActivity(env, {
         eventId,
         event: eventType,
-        tenantId: tenantCtx.tenantId,
+        clientToken: clientScope.clientToken,
         trigger,
         timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
         outcome: "skipped-unsupported-event",
@@ -792,27 +834,27 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
     if (eventType === "message.received") {
       const ids = extractMessageContext(payload);
       if (ids) {
-        CALL_HANDLERS.typingIndicator(env, ids, null, tenantCtx.apiKey).catch(() => {});
-        const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" }, null, tenantCtx.apiKey);
+        CALL_HANDLERS.typingIndicator(env, ids, null, clientScope.apiKey).catch(() => {});
+        const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" }, null, clientScope.apiKey);
         contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
         rawEventText += `\n\nسياق آخر الرسائل:\n${JSON.stringify(history.data).slice(0, 2500)}`;
       }
     } else if (eventType === "comment.received") {
       const ids = extractCommentContext(payload);
       if (ids) {
-        const history = await CALL_HANDLERS.listComments(env, { ...ids, limit: AUTO_CONTEXT_LIMIT }, null, tenantCtx.apiKey);
+        const history = await CALL_HANDLERS.listComments(env, { ...ids, limit: AUTO_CONTEXT_LIMIT }, null, clientScope.apiKey);
         contextFetched = { type: "comments", ids, ok: history.ok, status: history.status, data: history.data };
         rawEventText += `\n\nسياق تعليقات البوست:\n${JSON.stringify(history.data).slice(0, 2500)}`;
       }
     }
 
-    const trace = await runAgentLoop(env, rawEventText, eventId, tenantCtx);
+    const trace = await runAgentLoop(env, rawEventText, eventId, clientScope);
 
     const finishedAt = isoNow();
     const entry = {
       eventId,
       event: eventType,
-      tenantId: tenantCtx.tenantId,
+      clientToken: clientScope.clientToken,
       trigger,
       timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
       contextFetched,
@@ -829,20 +871,20 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       await kvSetJSON(
         env,
         `review:${eventId}`,
-        { eventId, event: eventType, tenantId: tenantCtx.tenantId, outcome: entry.outcome, error: entry.error, finalText: entry.finalText, ts: finishedAt },
+        { eventId, event: eventType, clientToken: clientScope.clientToken, outcome: entry.outcome, error: entry.error, finalText: entry.finalText, ts: finishedAt },
         LOG_TTL_SECONDS
       );
       throw new Error(`retry-requested:${entry.outcome}`);
     }
   } catch (err) {
     const finishedAt = isoNow();
-    const errMsg = redactSecret(String((err && err.message) || err), tenantCtx.apiKey);
+    const errMsg = redactSecret(String((err && err.message) || err), clientScope.apiKey);
     console.error("handleZernioEvent error", eventId, err);
     if (!errMsg.startsWith("retry-requested:")) {
       await logActivity(env, {
         eventId,
         event: eventType,
-        tenantId: tenantCtx.tenantId,
+        clientToken: clientScope.clientToken,
         trigger,
         timing: { receivedAt, startedAt, finishedAt, durationMs: new Date(finishedAt) - new Date(startedAt) },
         outcome: "internal-error",
@@ -851,7 +893,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       await kvSetJSON(
         env,
         `review:${eventId}`,
-        { eventId, event: eventType, tenantId: tenantCtx.tenantId, outcome: "internal-error", error: errMsg, ts: finishedAt },
+        { eventId, event: eventType, clientToken: clientScope.clientToken, outcome: "internal-error", error: errMsg, ts: finishedAt },
         LOG_TTL_SECONDS
       );
     }
@@ -860,38 +902,223 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 8) مسارات الـ API وإدارة المتاجر (Multi-Tenant Management)
+// 8) مسارات الآدمن والعملاء (Admin & Client Scoped API Router)
 // -----------------------------------------------------------------------------
 
 async function handleApiRequests(request, env, url) {
   const path = url.pathname;
   const method = request.method;
 
-  // استخراج معرّف المتجر من الهيدر أو الرابط
-  const tenantIdQuery = url.searchParams.get("tenantId") || request.headers.get("X-Tenant-Id");
-  const tenantCtx = await resolveTenantContext(env, null, tenantIdQuery);
+  // استخراج مفتاح الآدمن ومفتاح العميل
+  const adminKey = request.headers.get("X-Admin-Key") || url.searchParams.get("adminKey");
+  const clientTokenParam = request.headers.get("X-Client-Token") || url.searchParams.get("token");
+  const validAdminKey = env.STATUS_KEY || env.ADMIN_KEY || DEFAULT_ADMIN_KEY;
 
-  // 1. مسار إدارة المتاجر المتعددة (Create/List Tenants)
-  if (method === 'POST' && path === '/api/tenants') {
+  // ===========================================================================
+  // أ. مسارات الآدمن المحمية بمفتاح الآدمن (Admin Key Protected)
+  // ===========================================================================
+
+  // 1. إضافة حساب Zernio جديد إلى المستودع المجهول
+  if (method === 'POST' && path === '/api/admin/pools') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح." }, 401);
     const body = await request.json().catch(() => ({}));
-    const { id, name, apiKey, profileId, plan = "pro", maxAccounts = 2 } = body;
-    if (!id || !apiKey || !profileId) {
-      return jsonResponse({ error: "الحقول id, apiKey, profileId مطلوبة لإنشاء متجر جديد." }, 400);
+    const { apiKey, profileId, maxSlots = 2, note = "" } = body;
+    if (!apiKey || !profileId) return jsonResponse({ error: "apiKey و profileId مطلوبان." }, 400);
+
+    const pools = await getZernioPools(env);
+    const poolId = `pool_${shortId()}`;
+    pools.push({ poolId, apiKey: apiKey.trim(), profileId: profileId.trim(), maxSlots: Number(maxSlots), usedSlots: 0, note });
+    await saveZernioPools(env, pools);
+
+    return jsonResponse({ ok: true, message: "تمت إضافة حساب Zernio إلى المستودع بنجاح.", poolId, totalPools: pools.length });
+  }
+
+  // 2. عرض حسابات المستودع وسعتها الشاغرة
+  if (method === 'GET' && path === '/api/admin/pools') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح." }, 401);
+    const pools = await getZernioPools(env);
+    const totalSlots = pools.reduce((acc, p) => acc + (p.maxSlots || 2), 0);
+    const usedSlots = pools.reduce((acc, p) => acc + (p.usedSlots || 0), 0);
+    return jsonResponse({ ok: true, totalSlots, usedSlots, freeSlots: totalSlots - usedSlots, pools });
+  }
+
+  // 3. إنشاء عميل جديد وتوليد Token مخصص وحصة الحسابات
+  if (method === 'POST' && path === '/api/admin/clients') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح." }, 400);
+    const body = await request.json().catch(() => ({}));
+    const { name = "متجر جديد", maxAccounts = 2, plan = "pro" } = body;
+
+    const token = `cl_${shortId()}_${Date.now().toString(36).slice(-4)}`;
+    const clientData = {
+      token,
+      name,
+      maxAccounts: Number(maxAccounts),
+      plan,
+      connectedAccounts: [],
+      prompt: null,
+      filesContent: null,
+      filesMeta: null,
+      crmSchema: null,
+      createdAt: isoNow()
+    };
+
+    if (env.ZERNIO_KV) await kvSetJSON(env, `client:${token}`, clientData);
+
+    return jsonResponse({
+      ok: true,
+      message: "تم إنشاء كود العميل بنجاح.",
+      token,
+      client: clientData,
+      connectUrlPath: `tester.html?token=${token}`
+    });
+  }
+
+  // 4. جلب قائمة جميع العملاء وحساباتهم
+  if (method === 'GET' && path === '/api/admin/clients') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح." }, 401);
+    if (!env.ZERNIO_KV) return jsonResponse({ ok: true, clients: [] });
+    const listRes = await env.ZERNIO_KV.list({ prefix: "client:", limit: 1000 });
+    const clients = (await Promise.all(listRes.keys.map((k) => kvGetJSON(env, k.name)))).filter(Boolean);
+    return jsonResponse({ ok: true, count: clients.length, clients });
+  }
+
+  // 5. 🧹 فرمتة حساب عميل محدد وتحرير فتحاته في المستودع
+  if (method === 'POST' && path === '/api/admin/clients/reset') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح." }, 401);
+    const body = await request.json().catch(() => ({}));
+    const { token } = body;
+    if (!token) return jsonResponse({ error: "token مطلوب للفرمتة." }, 400);
+
+    const client = await kvGetJSON(env, `client:${token}`);
+    if (!client) return jsonResponse({ error: "العميل غير موجود." }, 404);
+
+    const disconnected = [];
+    for (const acc of (client.connectedAccounts || [])) {
+      try {
+        const poolMap = await kvGetJSON(env, `account_map:${acc.accountId}`);
+        const apiKey = poolMap?.apiKey || DEFAULT_ZERNIO_API_KEY;
+        await zernioFetch(env, `/accounts/${encodeURIComponent(acc.accountId)}`, { method: 'DELETE' }, apiKey);
+        if (acc.poolId) await releasePoolSlot(env, acc.poolId);
+        if (env.ZERNIO_KV) await env.ZERNIO_KV.delete(`account_map:${acc.accountId}`);
+        disconnected.push(acc.accountId);
+      } catch (e) {
+        console.error("Disconnect error on client reset:", e);
+      }
     }
+
+    // تصفير بيانات العميل
+    client.connectedAccounts = [];
+    client.prompt = null;
+    client.filesContent = null;
+    client.filesMeta = null;
+    await kvSetJSON(env, `client:${token}`, client);
+
+    // مسح سجلات الـ CRM الخاصة به
     if (env.ZERNIO_KV) {
-      await kvSetJSON(env, `tenant:${id}`, { id, name: name || id, apiKey, profileId, plan, maxAccounts, createdAt: isoNow() });
+      const crmList = await env.ZERNIO_KV.list({ prefix: `crm_lead:${token}:`, limit: 1000 });
+      for (const k of crmList.keys) await env.ZERNIO_KV.delete(k.name);
     }
-    return jsonResponse({ ok: true, message: `تم تسجيل وتخصيص المتجر (${name || id}) بنجاح.` });
+
+    return jsonResponse({
+      ok: true,
+      message: `تمت فرمتة حساب العميل (${client.name}) وتحرير كافة فتحاته بنجاح.`,
+      disconnectedAccounts: disconnected
+    });
   }
 
-  if (method === 'GET' && path === '/api/tenants') {
-    if (!env.ZERNIO_KV) return jsonResponse({ ok: true, tenants: [] });
-    const listRes = await env.ZERNIO_KV.list({ prefix: "tenant:", limit: 1000 });
-    const tenants = (await Promise.all(listRes.keys.map((k) => kvGetJSON(env, k.name)))).filter(Boolean);
-    return jsonResponse({ ok: true, count: tenants.length, tenants });
+  // 6. 🔄 نقل ملكية حساب أو متجر من عميل لآخر
+  if (method === 'POST' && path === '/api/admin/clients/transfer') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح." }, 401);
+    const body = await request.json().catch(() => ({}));
+    const { accountId, fromToken, toToken } = body;
+    if (!accountId || !fromToken || !toToken) return jsonResponse({ error: "الحقول accountId, fromToken, toToken مطلوبة." }, 400);
+
+    const fromClient = await kvGetJSON(env, `client:${fromToken}`);
+    const toClient = await kvGetJSON(env, `client:${toToken}`);
+    if (!fromClient || !toClient) return jsonResponse({ error: "أحد العملاء غير موجود." }, 404);
+
+    if ((toClient.connectedAccounts || []).length >= (toClient.maxAccounts || 2)) {
+      return jsonResponse({ error: "العميل المستلم استنفد حده الأقصى من الحسابات." }, 400);
+    }
+
+    const accIndex = (fromClient.connectedAccounts || []).findIndex(a => a.accountId === accountId);
+    if (accIndex === -1) return jsonResponse({ error: "الحساب غير موجود لدى العميل الأول." }, 404);
+
+    const [transferredAcc] = fromClient.connectedAccounts.splice(accIndex, 1);
+    toClient.connectedAccounts = toClient.connectedAccounts || [];
+    toClient.connectedAccounts.push(transferredAcc);
+
+    // تحديث جدول التوجيه العكسي O(1)
+    const map = await kvGetJSON(env, `account_map:${accountId}`);
+    if (map) {
+      map.clientToken = toToken;
+      await kvSetJSON(env, `account_map:${accountId}`, map);
+    }
+
+    await kvSetJSON(env, `client:${fromToken}`, fromClient);
+    await kvSetJSON(env, `client:${toToken}`, toClient);
+
+    return jsonResponse({ ok: true, message: `تم نقل ملكية الحساب (${accountId}) إلى (${toClient.name}) بنجاح.` });
   }
 
-  // 2. إحصائيات Zernio الرسمية
+  // 7. 🧹 الفرمتة الشاملة للمنظومة بالكامل
+  if (method === 'POST' && path === '/api/admin/factory-reset') {
+    if (adminKey !== validAdminKey) return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح أو مفقود." }, 401);
+
+    const disconnected = [];
+    const pools = await getZernioPools(env);
+    for (const p of pools) {
+      try {
+        const accRes = await zernioFetch(env, `/accounts?profileId=${p.profileId}`, {}, p.apiKey);
+        const accounts = Array.isArray(accRes.data) ? accRes.data : (accRes.data?.accounts || []);
+        for (const a of accounts) {
+          const id = a.id || a._id;
+          if (id) {
+            await zernioFetch(env, `/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }, p.apiKey);
+            disconnected.push(id);
+          }
+        }
+      } catch (_) {}
+    }
+
+    let deletedKeys = 0;
+    if (env.ZERNIO_KV) {
+      let cursor = undefined;
+      do {
+        const listRes = await env.ZERNIO_KV.list({ limit: 1000, cursor });
+        for (const k of listRes.keys) {
+          await env.ZERNIO_KV.delete(k.name);
+          deletedKeys++;
+        }
+        cursor = listRes.cursor;
+      } while (cursor);
+    }
+
+    return jsonResponse({ ok: true, message: "تمت فرمتة السيرفر بالكامل ومسح جميع الـ KV والحسابات.", deletedAccountsCount: disconnected.length, deletedKvKeysCount: deletedKeys });
+  }
+
+  // ===========================================================================
+  // ب. مسارات العميل وتطبيق tester.html (Scoped via Token)
+  // ===========================================================================
+
+  const clientScope = await resolveClientScope(env, clientTokenParam, null);
+
+  // 1. جلب بيانات جلسة العميل المباشرة
+  if (method === 'GET' && path === '/api/client/session') {
+    return jsonResponse({
+      ok: true,
+      clientToken: clientScope.clientToken,
+      name: clientScope.client.name || "متجري",
+      maxAccounts: clientScope.client.maxAccounts || 2,
+      connectedCount: (clientScope.client.connectedAccounts || []).length,
+      connectedAccounts: clientScope.client.connectedAccounts || [],
+      hasPrompt: !!clientScope.client.prompt,
+      hasFiles: !!clientScope.client.filesContent,
+      crmSchema: clientScope.client.crmSchema || "الاسم، رقم الهاتف، العنوان، المنتج المطلوب"
+    });
+  }
+
+  // 2. إحصائيات Zernio Volume لهذا العميل
   if (method === 'GET' && path === '/api/analytics') {
     const today = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -899,89 +1126,56 @@ async function handleApiRequests(request, env, url) {
     const toDate = url.searchParams.get('toDate') || today;
     const platform = url.searchParams.get('platform') || '';
 
-    const qs = new URLSearchParams({ fromDate, toDate, profileId: tenantCtx.profileId });
+    const qs = new URLSearchParams({ fromDate, toDate, profileId: clientScope.profileId });
     if (platform) qs.set('platform', platform);
 
-    const zernioRes = await zernioFetch(env, `/analytics/inbox/volume?${qs}`, {}, tenantCtx.apiKey);
+    const zernioRes = await zernioFetch(env, `/analytics/inbox/volume?${qs}`, {}, clientScope.apiKey);
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 3. جلب وفصل الحسابات
+  // 3. الحسابات المربوطة لهذا العميل
   if (method === 'GET' && path === '/api/accounts') {
-    const zernioRes = await zernioFetch(env, `/accounts?profileId=${tenantCtx.profileId}`, {}, tenantCtx.apiKey);
-    return jsonResponse(zernioRes.data, zernioRes.status);
+    return jsonResponse({ ok: true, accounts: clientScope.client.connectedAccounts || [] });
   }
 
+  // 4. فصل حساب للعميل وتحرير فتحته
   if (method === 'DELETE' && path.startsWith('/api/accounts/')) {
     const accountId = path.split('/api/accounts/')[1];
     if (!accountId) return jsonResponse({ error: 'accountId مطلوب' }, 400);
 
-    const zernioRes = await zernioFetch(env, `/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' }, tenantCtx.apiKey);
-    if (env.ZERNIO_KV) {
-      await env.ZERNIO_KV.delete(`account_to_tenant:${accountId}`).catch(() => {});
+    const map = await kvGetJSON(env, `account_map:${accountId}`);
+    const apiKey = map?.apiKey || clientScope.apiKey;
+    const poolId = map?.poolId;
+
+    const zernioRes = await zernioFetch(env, `/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' }, apiKey);
+
+    // تحديث حسابات العميل وتحرير الفتحة
+    if (clientScope.clientToken !== "default" && env.ZERNIO_KV) {
+      const client = await kvGetJSON(env, `client:${clientScope.clientToken}`);
+      if (client) {
+        client.connectedAccounts = (client.connectedAccounts || []).filter(a => a.accountId !== accountId);
+        await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+      }
     }
-    if (zernioRes.ok || zernioRes.status === 404) return jsonResponse({ ok: true, message: 'تم فصل الحساب بنجاح من Zernio' });
+
+    if (poolId) await releasePoolSlot(env, poolId);
+    if (env.ZERNIO_KV) await env.ZERNIO_KV.delete(`account_map:${accountId}`).catch(() => {});
+
+    if (zernioRes.ok || zernioRes.status === 404) return jsonResponse({ ok: true, message: 'تم فصل الحساب بنجاح وتحرير الفتحة.' });
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. 🧹 الفرمتة الشاملة المحمية بمفتاح الآدمن
-  if (method === 'POST' && path === '/api/admin/factory-reset') {
-    const body = await request.json().catch(() => ({}));
-    const providedKey = request.headers.get("X-Admin-Key") || body.adminKey || url.searchParams.get("key");
-    const validKey = env.STATUS_KEY || env.ADMIN_KEY || DEFAULT_ADMIN_KEY;
-
-    if (providedKey !== validKey) {
-      return jsonResponse({ error: "غير مصرح: مفتاح الآدمن (Admin Key) غير صحيح أو مفقود." }, 401);
-    }
-
-    const disconnectedAccounts = [];
-    try {
-      const accRes = await zernioFetch(env, `/accounts?profileId=${tenantCtx.profileId}`, {}, tenantCtx.apiKey);
-      const accounts = Array.isArray(accRes.data) ? accRes.data : (accRes.data?.accounts || []);
-      for (const acc of accounts) {
-        const id = acc.id || acc._id;
-        if (id) {
-          await zernioFetch(env, `/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }, tenantCtx.apiKey);
-          disconnectedAccounts.push({ id, name: acc.name || acc.username || acc.platform });
-        }
-      }
-    } catch (e) {
-      console.error("Factory reset accounts error:", e);
-    }
-
-    let deletedKeysCount = 0;
-    if (env.ZERNIO_KV) {
-      try {
-        let cursor = undefined;
-        do {
-          const listRes = await env.ZERNIO_KV.list({ limit: 1000, cursor });
-          for (const k of listRes.keys) {
-            await env.ZERNIO_KV.delete(k.name);
-            deletedKeysCount++;
-          }
-          cursor = listRes.cursor;
-        } while (cursor);
-      } catch (kvErr) {
-        console.error("Factory reset KV error:", kvErr);
-      }
-    }
-
-    return jsonResponse({
-      ok: true,
-      message: "تمت فرمتة السيرفر وحذف جميع الحسابات وبيانات الـ KV بالكامل.",
-      deletedAccountsCount: disconnectedAccounts.length,
-      disconnectedAccounts,
-      deletedKvKeysCount: deletedKeysCount,
-      resetAt: isoNow()
-    });
-  }
-
-  // 5. مسارات OAuth فيسبوك
+  // 5. مسارات تفويض فيسبوك مع حجز الفتحات التلقائي
   if (method === 'GET' && path === '/api/auth/facebook') {
+    if ((clientScope.client.connectedAccounts || []).length >= (clientScope.client.maxAccounts || 2)) {
+      return jsonResponse({ error: "تم استنفاد الحد الأقصى للحسابات المصرح بها لهذا العميل." }, 400);
+    }
+    const slotData = await allocateAvailablePoolSlot(env);
     const redirectUrl = url.searchParams.get('redirect_url') || '';
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${tenantCtx.profileId}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
-    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${tenantCtx.apiKey}` } });
-    return jsonResponse(await res.json().catch(() => ({})), res.status);
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${slotData.pool.profileId}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
+    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${slotData.pool.apiKey}` } });
+    const data = await res.json().catch(() => ({}));
+    return jsonResponse({ ...data, poolId: slotData.pool.poolId }, res.status);
   }
 
   if (method === 'GET' && path === '/api/auth/facebook/pages') {
@@ -989,123 +1183,162 @@ async function handleApiRequests(request, env, url) {
     const connectToken = url.searchParams.get('connect_token') || request.headers.get('x-connect-token') || '';
     if (!tempToken) return jsonResponse({ error: 'tempToken مطلوب' }, 400);
 
-    const headers = { Authorization: `Bearer ${tenantCtx.apiKey}` };
+    const slotData = await allocateAvailablePoolSlot(env);
+    const headers = { Authorization: `Bearer ${slotData.pool.apiKey}` };
     if (connectToken) headers['X-Connect-Token'] = connectToken;
 
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page?profileId=${tenantCtx.profileId}&tempToken=${encodeURIComponent(tempToken)}`;
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page?profileId=${slotData.pool.profileId}&tempToken=${encodeURIComponent(tempToken)}`;
     const res = await fetch(zernioUrl, { headers });
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
   if (method === 'POST' && path === '/api/auth/facebook/select') {
     const body = await request.json().catch(() => ({}));
-    body.profileId = tenantCtx.profileId;
+    const slotData = await allocateAvailablePoolSlot(env);
+    body.profileId = slotData.pool.profileId;
+
     const connectToken = body.connect_token || request.headers.get('x-connect-token') || '';
-    const headers = { Authorization: `Bearer ${tenantCtx.apiKey}`, 'Content-Type': 'application/json' };
+    const headers = { Authorization: `Bearer ${slotData.pool.apiKey}`, 'Content-Type': 'application/json' };
     if (connectToken) headers['X-Connect-Token'] = connectToken;
 
     const res = await fetch(`${ZERNIO_API_BASE}/connect/facebook/select-page`, { method: 'POST', headers, body: JSON.stringify(body) });
     const data = await res.json().catch(() => ({}));
-    
-    // ربط الحساب بالمتجر في جدول التوجيه العكسي O(1)
-    if (res.ok && data.account?.accountId && env.ZERNIO_KV) {
-      await kvSetJSON(env, `account_to_tenant:${data.account.accountId}`, {
-        tenantId: tenantCtx.tenantId,
-        apiKey: tenantCtx.apiKey,
-        profileId: tenantCtx.profileId
-      });
+
+    if (res.ok && data.account?.accountId) {
+      await slotData.confirmAllocation();
+      const accountId = data.account.accountId;
+
+      // ربط الحساب بالعميل
+      if (env.ZERNIO_KV) {
+        await kvSetJSON(env, `account_map:${accountId}`, {
+          clientToken: clientScope.clientToken,
+          poolId: slotData.pool.poolId,
+          apiKey: slotData.pool.apiKey,
+          profileId: slotData.pool.profileId,
+          platform: "facebook"
+        });
+
+        if (clientScope.clientToken !== "default") {
+          const client = await kvGetJSON(env, `client:${clientScope.clientToken}`) || clientScope.client;
+          client.connectedAccounts = client.connectedAccounts || [];
+          client.connectedAccounts.push({ accountId, platform: "facebook", name: data.account.displayName || data.account.username || "صفحة فيسبوك", poolId: slotData.pool.poolId });
+          await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+        }
+      }
     }
     return jsonResponse(data, res.status);
   }
 
-  // 6. مسارات OAuth إنستغرام
+  // 6. مسارات تفويض إنستغرام مع حجز الفتحات
   if (method === 'GET' && path === '/api/auth/instagram') {
+    if ((clientScope.client.connectedAccounts || []).length >= (clientScope.client.maxAccounts || 2)) {
+      return jsonResponse({ error: "تم استنفاد الحد الأقصى للحسابات المسموحة لهذا العميل." }, 400);
+    }
+    const slotData = await allocateAvailablePoolSlot(env);
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram?profileId=${tenantCtx.profileId}&headless=true&loginMethod=${loginMethod}&redirect_url=${encodeURIComponent(redirectUrl)}`;
-    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${tenantCtx.apiKey}` } });
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram?profileId=${slotData.pool.profileId}&headless=true&loginMethod=${loginMethod}&redirect_url=${encodeURIComponent(redirectUrl)}`;
+    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${slotData.pool.apiKey}` } });
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
   if (method === 'GET' && path === '/api/auth/instagram/accounts') {
     const tempToken = url.searchParams.get('tempToken');
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${tenantCtx.profileId}&tempToken=${tempToken}`;
-    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${tenantCtx.apiKey}` } });
+    const slotData = await allocateAvailablePoolSlot(env);
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/instagram/select-account?profileId=${slotData.pool.profileId}&tempToken=${tempToken}`;
+    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${slotData.pool.apiKey}` } });
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
   if (method === 'POST' && path === '/api/auth/instagram/select') {
     const body = await request.json().catch(() => ({}));
-    body.profileId = tenantCtx.profileId;
+    const slotData = await allocateAvailablePoolSlot(env);
+    body.profileId = slotData.pool.profileId;
+
     const res = await fetch(`${ZERNIO_API_BASE}/connect/instagram/select-account`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${tenantCtx.apiKey}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${slotData.pool.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     const data = await res.json().catch(() => ({}));
 
-    if (res.ok && data.account?.accountId && env.ZERNIO_KV) {
-      await kvSetJSON(env, `account_to_tenant:${data.account.accountId}`, {
-        tenantId: tenantCtx.tenantId,
-        apiKey: tenantCtx.apiKey,
-        profileId: tenantCtx.profileId
-      });
+    if (res.ok && data.account?.accountId) {
+      await slotData.confirmAllocation();
+      const accountId = data.account.accountId;
+
+      if (env.ZERNIO_KV) {
+        await kvSetJSON(env, `account_map:${accountId}`, {
+          clientToken: clientScope.clientToken,
+          poolId: slotData.pool.poolId,
+          apiKey: slotData.pool.apiKey,
+          profileId: slotData.pool.profileId,
+          platform: "instagram"
+        });
+
+        if (clientScope.clientToken !== "default") {
+          const client = await kvGetJSON(env, `client:${clientScope.clientToken}`) || clientScope.client;
+          client.connectedAccounts = client.connectedAccounts || [];
+          client.connectedAccounts.push({ accountId, platform: "instagram", name: data.account.username || "حساب إنستغرام", poolId: slotData.pool.poolId });
+          await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+        }
+      }
     }
     return jsonResponse(data, res.status);
   }
 
-  // 7. مسار تفويض TikTok
+  // 7. تفويض TikTok مع حجز الفتحات
   if (method === 'GET' && path === '/api/auth/tiktok') {
+    if ((clientScope.client.connectedAccounts || []).length >= (clientScope.client.maxAccounts || 2)) {
+      return jsonResponse({ error: "تم استنفاد الحد الأقصى للحسابات المسموحة لهذا العميل." }, 400);
+    }
+    const slotData = await allocateAvailablePoolSlot(env);
     const redirectUrl = url.searchParams.get('redirect_url') || '';
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/tiktok?profileId=${tenantCtx.profileId}&redirect_url=${encodeURIComponent(redirectUrl)}`;
-    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${tenantCtx.apiKey}` } });
+    const zernioUrl = `${ZERNIO_API_BASE}/connect/tiktok?profileId=${slotData.pool.profileId}&redirect_url=${encodeURIComponent(redirectUrl)}`;
+    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${slotData.pool.apiKey}` } });
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 8. حفظ واسترجاع الـ System Prompt (يدعم المتاجر المحددة أو العام)
+  // 8. حفظ واسترجاع البرومبت للعميل
   if (method === 'POST' && path === '/api/set-prompt') {
     const body = await request.json().catch(() => ({}));
     if (!body.prompt) return jsonResponse({ error: 'حقل prompt مفقود' }, 400);
-    if (env.ZERNIO_KV) {
-      if (tenantCtx.tenantId !== "default") {
-        const tenant = await kvGetJSON(env, `tenant:${tenantCtx.tenantId}`) || {};
-        tenant.prompt = body.prompt;
-        await kvSetJSON(env, `tenant:${tenantCtx.tenantId}`, tenant);
-      } else {
-        await env.ZERNIO_KV.put('custom_agent_prompt', body.prompt);
-      }
+
+    if (clientScope.clientToken !== "default" && env.ZERNIO_KV) {
+      const client = await kvGetJSON(env, `client:${clientScope.clientToken}`) || clientScope.client;
+      client.prompt = body.prompt;
+      await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+    } else if (env.ZERNIO_KV) {
+      await env.ZERNIO_KV.put('custom_agent_prompt', body.prompt);
     }
     return jsonResponse({ ok: true, message: 'تم حفظ البرومبت بنجاح' });
   }
 
   if (method === 'GET' && path === '/api/get-prompt') {
-    return jsonResponse({ ok: true, prompt: tenantCtx.prompt || 'البرومبت الافتراضي نشط' });
+    return jsonResponse({ ok: true, prompt: clientScope.client.prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 9. 📁 رفع وتحليل ملفات المتجر بالـ AI مع التحقق الصارم المانع لرفع "غير معرف"
+  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي مع التحقق الصارم
   if (method === 'POST' && (path === '/api/upload-file' || path === '/api/upload-rag-doc')) {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
     if (!textContent) return jsonResponse({ error: 'محتوى الملف مفقود' }, 400);
 
     try {
-      const structuredKnowledge = await synthesizeStoreKnowledgeStrict(env, textContent, name || "مستند المتجر");
+      const structuredKnowledge = await synthesizeStoreKnowledgeStrict(env, textContent, name || "ملف المتجر");
 
-      if (env.ZERNIO_KV) {
-        if (tenantCtx.tenantId !== "default") {
-          const tenant = await kvGetJSON(env, `tenant:${tenantCtx.tenantId}`) || {};
-          tenant.filesContent = structuredKnowledge;
-          tenant.filesMeta = { name, size, updatedAt: isoNow() };
-          await kvSetJSON(env, `tenant:${tenantCtx.tenantId}`, tenant);
-        } else {
-          await env.ZERNIO_KV.put('store_files_content', structuredKnowledge);
-          await env.ZERNIO_KV.put('store_files_meta', JSON.stringify({ name, size, updatedAt: isoNow() }));
-        }
+      if (clientScope.clientToken !== "default" && env.ZERNIO_KV) {
+        const client = await kvGetJSON(env, `client:${clientScope.clientToken}`) || clientScope.client;
+        client.filesContent = structuredKnowledge;
+        client.filesMeta = { name, size, updatedAt: isoNow() };
+        await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+      } else if (env.ZERNIO_KV) {
+        await env.ZERNIO_KV.put('store_files_content', structuredKnowledge);
+        await env.ZERNIO_KV.put('store_files_meta', JSON.stringify({ name, size, updatedAt: isoNow() }));
       }
 
       return jsonResponse({
         ok: true,
-        message: `تم تحليل وفهم محتوى ملف (${name}) ودمج معرفته مع الوكيل بنجاح!`,
+        message: `تم تحليل وفهم محتوى ملف (${name}) ودمجه في معرفة الوكيل بنجاح!`,
         synthesizedPreview: structuredKnowledge.slice(0, 300)
       });
     } catch (synthErr) {
@@ -1114,44 +1347,41 @@ async function handleApiRequests(request, env, url) {
   }
 
   if (method === 'POST' && (path === '/api/delete-file' || path === '/api/delete-rag-doc')) {
-    if (env.ZERNIO_KV) {
-      if (tenantCtx.tenantId !== "default") {
-        const tenant = await kvGetJSON(env, `tenant:${tenantCtx.tenantId}`) || {};
-        delete tenant.filesContent;
-        delete tenant.filesMeta;
-        await kvSetJSON(env, `tenant:${tenantCtx.tenantId}`, tenant);
-      } else {
-        await env.ZERNIO_KV.delete('store_files_content');
-        await env.ZERNIO_KV.delete('store_files_meta');
-      }
+    if (clientScope.clientToken !== "default" && env.ZERNIO_KV) {
+      const client = await kvGetJSON(env, `client:${clientScope.clientToken}`) || clientScope.client;
+      client.filesContent = null;
+      client.filesMeta = null;
+      await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+    } else if (env.ZERNIO_KV) {
+      await env.ZERNIO_KV.delete('store_files_content');
+      await env.ZERNIO_KV.delete('store_files_meta');
     }
     return jsonResponse({ ok: true, message: 'تم مسح ملفات المتجر بنجاح' });
   }
 
-  // 10. 📊 تخصيص أعمدة واسترجاع بيانات الـ CRM
+  // 10. 📊 إدارة أعمدة وسجلات الـ CRM للعميل
   if (method === 'POST' && path === '/api/set-crm-schema') {
     const body = await request.json().catch(() => ({}));
     const schema = body.schema || '';
-    if (env.ZERNIO_KV) {
-      if (tenantCtx.tenantId !== "default") {
-        const tenant = await kvGetJSON(env, `tenant:${tenantCtx.tenantId}`) || {};
-        tenant.crmSchema = schema;
-        await kvSetJSON(env, `tenant:${tenantCtx.tenantId}`, tenant);
-      } else {
-        await env.ZERNIO_KV.put('crm_custom_schema', schema);
-      }
+
+    if (clientScope.clientToken !== "default" && env.ZERNIO_KV) {
+      const client = await kvGetJSON(env, `client:${clientScope.clientToken}`) || clientScope.client;
+      client.crmSchema = schema;
+      await kvSetJSON(env, `client:${clientScope.clientToken}`, client);
+    } else if (env.ZERNIO_KV) {
+      await env.ZERNIO_KV.put('crm_custom_schema', schema);
     }
     return jsonResponse({ ok: true, message: 'تم تحديث أعمدة الـ CRM بنجاح' });
   }
 
   if (method === 'GET' && path === '/api/get-crm-schema') {
-    return jsonResponse({ ok: true, schema: tenantCtx.crmSchema || 'الاسم، رقم الهاتف، العنوان، المنتج المطلوب' });
+    return jsonResponse({ ok: true, schema: clientScope.client.crmSchema || 'الاسم، رقم الهاتف، العنوان، المنتج المطلوب' });
   }
 
   if (method === 'GET' && path === '/api/crm/leads') {
     if (!env.ZERNIO_KV) return jsonResponse({ ok: true, count: 0, leads: [] });
     try {
-      const prefix = tenantCtx.tenantId !== "default" ? `crm_lead:${tenantCtx.tenantId}:` : "crm_lead:";
+      const prefix = `crm_lead:${clientScope.clientToken}:`;
       const listRes = await env.ZERNIO_KV.list({ prefix, limit: 1000 });
       const leads = (await Promise.all(listRes.keys.map((k) => kvGetJSON(env, k.name)))).filter(Boolean);
       leads.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
@@ -1163,35 +1393,24 @@ async function handleApiRequests(request, env, url) {
 
   if (method === 'POST' && path === '/api/crm/clear-leads') {
     if (env.ZERNIO_KV) {
-      const prefix = tenantCtx.tenantId !== "default" ? `crm_lead:${tenantCtx.tenantId}:` : "crm_lead:";
+      const prefix = `crm_lead:${clientScope.clientToken}:`;
       const listRes = await env.ZERNIO_KV.list({ prefix, limit: 1000 });
-      for (const k of listRes.keys) {
-        await env.ZERNIO_KV.delete(k.name);
-      }
+      for (const k of listRes.keys) await env.ZERNIO_KV.delete(k.name);
     }
-    return jsonResponse({ ok: true, message: 'تم تفريغ كافة سجلات الـ CRM بنجاح' });
+    return jsonResponse({ ok: true, message: 'تم تفريغ كافة سجلات الـ CRM لهذا العميل بنجاح' });
   }
 
-  // 11. نظرة عامة للأدمن
+  // 11. نظرة عامة
   if (method === 'GET' && path === '/api/admin/overview') {
-    const prompt = tenantCtx.prompt || (env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null);
-    const filesMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('store_files_meta') : null;
-    const filesContent = tenantCtx.filesContent || (env.ZERNIO_KV ? await env.ZERNIO_KV.get('store_files_content') : null);
-    const crmSchema = tenantCtx.crmSchema || (env.ZERNIO_KV ? await env.ZERNIO_KV.get('crm_custom_schema') : null);
-
     return jsonResponse({
       ok: true,
       service: "Bedaya Enterprise Master Engine v25.0",
-      tenant: tenantCtx.tenantName,
-      tenantId: tenantCtx.tenantId,
+      clientName: clientScope.client.name,
+      clientToken: clientScope.clientToken,
       model: AI_ROUTER_MODEL,
-      prompt: prompt || 'البرومبت الافتراضي نشط',
-      crmSchema: crmSchema || 'افتراضي',
-      files: {
-        active: !!filesContent,
-        meta: filesMeta ? JSON.parse(filesMeta) : null,
-        preview: filesContent ? filesContent.slice(0, 400) : null
-      }
+      hasPrompt: !!clientScope.client.prompt,
+      hasFiles: !!clientScope.client.filesContent,
+      connectedAccounts: (clientScope.client.connectedAccounts || []).length
     });
   }
 
@@ -1201,7 +1420,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, count: logs.length, logs });
   }
 
-  // 13. اختبار الشات والمحاكاة المباشرة
+  // 13. اختبار الشات والمحاكاة المباشرة للعميل
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار المتاحة؟';
@@ -1212,7 +1431,7 @@ async function handleApiRequests(request, env, url) {
     });
 
     try {
-      const result = await runAgentLoop(env, fakeEventText, `test_${Date.now()}`, tenantCtx);
+      const result = await runAgentLoop(env, fakeEventText, `test_${Date.now()}`, clientScope);
       const lastCall = result.steps?.find(s => s.type === 'call')?.calls?.[0];
       return jsonResponse({
         ok: true,
@@ -1230,7 +1449,7 @@ async function handleApiRequests(request, env, url) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) استقبال الـ Webhook المموه (Stealth Dynamic Routing)
+// 9) استقبال الويب هوك المموه (Stealth Dynamic Routing)
 // -----------------------------------------------------------------------------
 
 async function handleWebhook(request, env) {
@@ -1401,7 +1620,7 @@ async function handleDashboard(request, env) {
 }
 
 // -----------------------------------------------------------------------------
-// 11) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
+// 11) نقطة الدخول واستقبال الويب هوك ومستهلك الطوابير
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1417,7 +1636,7 @@ export default {
         return await handleApiRequests(request, env, url);
       }
 
-      // استقبال الويب هوك المموه والديناميكي (يقبل /webhook/zernio أو /webhook/:slug أو /wh/:slug)
+      // مسار الويب هوك المموه والديناميكي
       if (request.method === "POST" && (url.pathname.startsWith("/webhook") || url.pathname.startsWith("/wh"))) {
         return await handleWebhook(request, env);
       }
@@ -1427,8 +1646,8 @@ export default {
       }
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-        const tenantCtx = await resolveTenantContext(env, null, url.searchParams.get("tenantId"));
-        const apiKey = tenantCtx.apiKey;
+        const clientScope = await resolveClientScope(env, url.searchParams.get("token"));
+        const apiKey = clientScope.apiKey;
 
         const secrets = {
           ZERNIO_API_KEY: !!apiKey,
@@ -1438,7 +1657,7 @@ export default {
 
         let zernioRest = { connected: false };
         try {
-          const res = await fetch(`${ZERNIO_API_BASE}/accounts?profileId=${tenantCtx.profileId}`, {
+          const res = await fetch(`${ZERNIO_API_BASE}/accounts?profileId=${clientScope.profileId}`, {
             headers: { Authorization: `Bearer ${apiKey}` },
           });
           if (res.ok) {
@@ -1456,7 +1675,7 @@ export default {
         const since = computeSinceDate(url);
         const logs = await listRecentLogs(env, { eventId, since });
 
-        return jsonResponse({ ok: true, tenant: tenantCtx.tenantName, secrets, zernioRest, tools: buildToolsManifest(), logs });
+        return jsonResponse({ ok: true, client: clientScope.client.name, secrets, zernioRest, tools: buildToolsManifest(), logs });
       }
 
       if (request.method === "GET" && url.pathname === "/dashboard") {
@@ -1473,7 +1692,6 @@ export default {
 
   // مستهلك الطوابير (معالجة إلزامية لـ DLQ لضمان عدم سقوط أي رسالة نهائياً)
   async queue(batch, env) {
-    // 1. طابور الـ Dead Letter Queue (المعالجة الإلزامية الطارئة)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
         const { rawBody, payload, receivedAt } = message.body || {};
@@ -1497,7 +1715,7 @@ export default {
       return;
     }
 
-    // 2. الطابور الرئيسي مع تأخير تصاعدي (10 محاولات)
+    // الطابور الرئيسي مع تأخير تصاعدي (10 محاولات)
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
