@@ -2,6 +2,8 @@
 // Bedaya Enterprise Social Inbox Agent (v24.0: AI File Synthesizer & Custom CRM)
 // =============================================================================
 
+
+
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
 const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
 const DEFAULT_ADMIN_KEY = "bedaya_admin_2026"; // مفتاح الآدمن الافتراضي للفرمتة
