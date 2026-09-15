@@ -1,27 +1,30 @@
 // =============================================================================
-// Bedaya Enterprise Social Inbox Agent (v23.0: Multimodal + Custom CRM + DLQ Heal)
+// Bedaya Enterprise Social Inbox Agent (v24.0: AI File Synthesizer & Custom CRM)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
 const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
+const DEFAULT_ADMIN_KEY = "bedaya_admin_2026"; // مفتاح الآدمن الافتراضي للفرمتة
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
-const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
+// الثوابت التشغيلية المحدثة
+const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
+const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
 const LOG_LIST_LIMIT = 50;
 
 const MAX_AGENT_STEPS = 10;
 const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
-const AUTO_CONTEXT_LIMIT = 20;
+const AUTO_CONTEXT_LIMIT = 10; // سياق 10 رسائل لسرعة المعالجة
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-zernio-key, x-connect-token, X-Connect-Token, X-Admin-Key',
 };
 
 // -----------------------------------------------------------------------------
@@ -125,20 +128,8 @@ function redactSecret(text, secret) {
   return text.split(secret).join("[REDACTED]");
 }
 
-// تحميل الصوت كـ Base64 للنماذج المتعددة الوسائط
-async function fetchAudioAsBase64(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-    return btoa(binary);
-  } catch (_) { return null; }
-}
-
 // -----------------------------------------------------------------------------
-// 2) كتالوج أدوات الوكيل (Zernio Handlers + CRM + Spam Tool)
+// 2) كتالوج أدوات الوكيل (Zernio Handlers + Custom CRM + Spam Tool)
 // -----------------------------------------------------------------------------
 
 async function zernioFetch(env, path, options = {}) {
@@ -152,7 +143,7 @@ async function zernioFetch(env, path, options = {}) {
   const res = await Promise.race([
     fetch(url, { ...options, headers }),
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`انتهت مهلة نداء Zernio API (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`انتهت مهلة اتصال Zernio API (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
     ),
   ]);
   const bodyText = await res.text();
@@ -179,7 +170,7 @@ const TOOL_DESCRIPTIONS = {
   replyToComment: "الرد على تعليق (فيسبوك، إنستغرام، تيك توك)",
   sendPrivateReply: "إرسال DM خاص لصاحب تعليق",
   deleteComment: "حذف تعليق",
-  ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام أو الإعلانات المزعجة)",
+  ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام أو الإعلانات المزعجة أو الإساءة)",
   saveToCrm: "تسجيل وحفظ بيانات العميل والطلب في نظام علاقات العملاء (CRM)",
 };
 
@@ -293,6 +284,7 @@ const CALL_HANDLERS = {
     return zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}?${qs}`, { method: "DELETE" });
   },
 
+  // أداة تجاهل السبام والمحادثات غير المرغوبة
   async ignoreMessage(env, args) {
     const { reason = "spam", notes = "" } = args || {};
     return {
@@ -302,17 +294,17 @@ const CALL_HANDLERS = {
     };
   },
 
-  // 📊 أداة حفظ العميل والطلب في الـ CRM
+  // أداة حفظ بيانات الطلب والعميل في الـ CRM
   async saveToCrm(env, args) {
     const { leadData = {} } = args || {};
     if (env.ZERNIO_KV) {
       const leadId = `crm_lead:${isoNow()}:${shortId()}`;
-      await kvSetJSON(env, leadId, { ...leadData, createdAt: isoNow() }, 30 * 24 * 60 * 60);
+      await kvSetJSON(env, leadId, { ...leadData, createdAt: isoNow() }, 60 * 24 * 60 * 60);
     }
     return {
       ok: true,
       status: 200,
-      data: { action: "saved_to_crm", leadData, message: "تم تسجيل بيانات العميل في الـ CRM بنجاح." }
+      data: { action: "saved_to_crm", leadData, message: "تم تسجيل وحفظ بيانات العميل في الـ CRM بنجاح." }
     };
   }
 };
@@ -355,33 +347,33 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 3) بناء الـ System Prompt الديناميكي مع RAG وأعمدة الـ CRM
+// 3) بناء الـ System Prompt الديناميكي (الملفات المحللة + أعمدة الـ CRM)
 // -----------------------------------------------------------------------------
 
 async function buildAgentSystemInstruction(env) {
   let customPrompt = "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages وعلى التعليقات (فيسبوك، انستجرام، وتيك توك) باحترافية وسرعة.";
-  let ragSection = "";
+  let filesSection = "";
   let crmSection = "";
 
   if (env.ZERNIO_KV) {
     const savedPrompt = await env.ZERNIO_KV.get("custom_agent_prompt").catch(() => null);
     if (savedPrompt && savedPrompt.trim()) customPrompt = savedPrompt.trim();
 
-    const ragDoc = await env.ZERNIO_KV.get("rag_doc_content").catch(() => null);
-    if (ragDoc && ragDoc.trim()) {
-      ragSection = `\n=== مستندات وقاعدة المعرفة (RAG Knowledge Base) ===\nاستند بدقة للتفاصيل والأسعار التالية:\n${ragDoc.trim()}\n`;
+    const analyzedFiles = await env.ZERNIO_KV.get("store_files_content").catch(() => null);
+    if (analyzedFiles && analyzedFiles.trim()) {
+      filesSection = `\n=== ملفات ومستندات النشاط التجاري (Store Knowledge Files) ===\nاستند بدقة للتفاصيل والمنتجات والأسعار التالية:\n${analyzedFiles.trim()}\n`;
     }
 
     const crmSchema = await env.ZERNIO_KV.get("crm_custom_schema").catch(() => null);
     if (crmSchema && crmSchema.trim()) {
-      crmSection = `\n=== أعمدة تسجيل بيانات العملاء (CRM Schema) ===\nعند جمع بيانات الطلب من العميل، استدعِ أداة saveToCrm بالحقول التالية:\n${crmSchema.trim()}\n`;
+      crmSection = `\n=== أعمدة تسجيل بيانات العملاء (CRM Schema) ===\nعند اتفاق العميل على الشراء أو حجز موعد، استدعِ أداة saveToCrm بالحقول التالية:\n${crmSchema.trim()}\n`;
     }
   }
 
   return [
     "=== تعليمات وشخصية المتجر (أولوية قصوى) ===",
     customPrompt,
-    ragSection,
+    filesSection,
     crmSection,
     "=== قواعد عمل نظام الوكيل والرد ===",
     "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات الواردة من Zernio (Instagram, Facebook, TikTok).",
@@ -392,7 +384,7 @@ async function buildAgentSystemInstruction(env) {
     '2) {"action": "final", "text": "..."}',
     "",
     "القواعد:",
-    "1. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
+    "1. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة أو تكرار عشوائي: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
     "2. عند إتمام اتفاق أو طلب مع العميل وجمع بياناته: استخدم أداة saveToCrm لتسجيل البيانات في الـ CRM.",
     "",
     "── كتالوج أدوات الـ DM (event = message.received) ──",
@@ -415,7 +407,7 @@ async function buildAgentSystemInstruction(env) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) عميل الموديل (AI Router Client)
+// 4) عميل الموديل ومحلل الملفات الذكي (AI Router & File Synthesizer)
 // -----------------------------------------------------------------------------
 
 function contentsToMessages(systemInstruction, contents) {
@@ -488,6 +480,42 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
     });
   }
   return extractRouterText(data);
+}
+
+// دالة تحليل واستخراج معرفة الملفات بالذكاء الاصطناعي
+async function synthesizeStoreKnowledge(env, rawFileText, fileName) {
+  const prompt = `أنت خبير تحليل بيانات الأنشطة التجارية والمتاجر. قم بقراءة وفهم محتوى هذا الملف (${fileName}) واستخرج منه جميع المعلومات الأساسية للمتجر (المنتجات، الأسعار، العروض، سياسات الشحن والضمان، والأسئلة الشائعة). قم بتلخيصها وصياغتها في شكل قاعدة معرفة واضحة ومباشرة ومنظمة باللغة العربية.
+
+محتوى الملف الخام:
+${rawFileText.slice(0, 15000)}
+
+قاعدة المعرفة المستخرجة:`;
+
+  const messages = [
+    { role: "system", content: "أنت خبير استخراج وتلخيص المعرفة التجارية للوكلاء الذكيين." },
+    { role: "user", content: prompt }
+  ];
+
+  const url = `${AI_ROUTER_BASE}/chat/completions`;
+  const apiKey = env.AI_ROUTER_API_KEY || env.GEMINI_API_KEY || WORKER_ZERNIO_API_KEY;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: AI_ROUTER_MODEL,
+        messages,
+        temperature: 0.2,
+        max_tokens: 1500
+      })
+    });
+    const data = await res.json();
+    return extractRouterText(data).trim();
+  } catch (err) {
+    console.error("File synthesis error, fallback to raw text:", err);
+    return rawFileText.slice(0, 5000);
+  }
 }
 
 function extractJsonObject(text) {
@@ -677,7 +705,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
     let rawEventText = rawBody;
     let contextFetched = null;
 
-    // فحص المرفقات الصوتية (Voice Notes)
+    // فحص الملاحظات الصوتية (Voice Notes)
     const audioAttachment = (payload.message?.attachments || []).find(a => a.type === 'audio' || a.originalType === 'audio');
     if (audioAttachment && audioAttachment.url) {
       rawEventText += `\n\n[ملاحظة صوتية واردة من العميل]: مرفق ملف صوتي في الرابط: ${audioAttachment.url}`;
@@ -689,7 +717,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
         CALL_HANDLERS.typingIndicator(env, ids).catch(() => {});
         const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" });
         contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
-        rawEventText += `\n\nسياق آخر الرسائل:\n${JSON.stringify(history.data).slice(0, 3000)}`;
+        rawEventText += `\n\nسياق آخر الرسائل:\n${JSON.stringify(history.data).slice(0, 2500)}`;
       } else {
         contextFetched = { type: "messages", error: "extractMessageContext فشل في استخراج المعرفات" };
       }
@@ -698,7 +726,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       if (ids) {
         const history = await CALL_HANDLERS.listComments(env, { ...ids, limit: AUTO_CONTEXT_LIMIT });
         contextFetched = { type: "comments", ids, ok: history.ok, status: history.status, data: history.data };
-        rawEventText += `\n\nسياق تعليقات البوست:\n${JSON.stringify(history.data).slice(0, 3000)}`;
+        rawEventText += `\n\nسياق تعليقات البوست:\n${JSON.stringify(history.data).slice(0, 2500)}`;
       } else {
         contextFetched = { type: "comments", error: "extractCommentContext فشل في استخراج المعرفات" };
       }
@@ -756,7 +784,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 7) مسارات الـ API
+// 7) مسارات الـ API (OAuth, Files, CRM Leads, Analytics, Factory Reset)
 // -----------------------------------------------------------------------------
 
 async function handleApiRequests(request, env, url) {
@@ -765,7 +793,7 @@ async function handleApiRequests(request, env, url) {
   const API_KEY = (env.ZERNIO_API_KEY || WORKER_ZERNIO_API_KEY || '').trim();
   const PROFILE_ID = (env.ZERNIO_PROFILE_ID || WORKER_ZERNIO_PROFILE_ID || '').trim();
 
-  // 1. إحصائيات Zernio الرسمية
+  // 1. إحصائيات Zernio الرسمية (Volume Analytics)
   if (method === 'GET' && path === '/api/analytics') {
     const today = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -786,7 +814,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 3. فصل الحساب بالـ ID
+  // 3. فصل حساب محدد بالـ ID
   if (method === 'DELETE' && path.startsWith('/api/accounts/')) {
     const accountId = path.split('/api/accounts/')[1];
     if (!accountId) return jsonResponse({ error: 'accountId مطلوب' }, 400);
@@ -796,10 +824,17 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. 🧹 الفرمتة الشاملة للسيرفر (Factory Reset)
+  // 4. 🧹 الفرمتة الشاملة للسيرفر مع التحقق من مفتاح الآدمن (Admin Key Protected)
   if (method === 'POST' && path === '/api/admin/factory-reset') {
-    const disconnectedAccounts = [];
+    const body = await request.json().catch(() => ({}));
+    const providedKey = request.headers.get("X-Admin-Key") || body.adminKey || url.searchParams.get("key");
+    const validKey = env.STATUS_KEY || env.ADMIN_KEY || DEFAULT_ADMIN_KEY;
 
+    if (providedKey !== validKey) {
+      return jsonResponse({ error: "غير مصرح: مفتاح الآدمن (Admin Key) غير صحيح أو مفقود." }, 401);
+    }
+
+    const disconnectedAccounts = [];
     try {
       const accRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
       const accounts = Array.isArray(accRes.data) ? accRes.data : (accRes.data?.accounts || []);
@@ -833,7 +868,7 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      message: "تمت فرمتة السيرفر ومسح كافة الحسابات والبيانات بالكامل.",
+      message: "تمت فرمتة السيرفر وحذف جميع الحسابات وبيانات الـ KV بالكامل.",
       deletedAccountsCount: disconnectedAccounts.length,
       disconnectedAccounts,
       deletedKvKeysCount: deletedKeysCount,
@@ -921,33 +956,40 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 9. مستند الـ RAG
-  if (method === 'POST' && path === '/api/upload-rag-doc') {
+  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Files Synthesizer)
+  if (method === 'POST' && (path === '/api/upload-file' || path === '/api/upload-rag-doc')) {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
     if (!textContent) return jsonResponse({ error: 'محتوى الملف مفقود' }, 400);
 
+    // تحليل واستخراج المعرفة من الملف بالـ AI Router
+    const structuredKnowledge = await synthesizeStoreKnowledge(env, textContent, name || "مستند المتجر");
+
     if (env.ZERNIO_KV) {
-      await env.ZERNIO_KV.put('rag_doc_content', textContent);
-      await env.ZERNIO_KV.put('rag_doc_meta', JSON.stringify({ name, size, updatedAt: isoNow() }));
+      await env.ZERNIO_KV.put('store_files_content', structuredKnowledge);
+      await env.ZERNIO_KV.put('store_files_meta', JSON.stringify({ name, size, updatedAt: isoNow() }));
     }
-    return jsonResponse({ ok: true, message: `تم حفظ وفهرسة مستند (${name}) بنجاح` });
+    return jsonResponse({
+      ok: true,
+      message: `تم تحليل وفهم محتوى ملف (${name}) ودمجه في معرفة الوكيل بنجاح!`,
+      synthesizedPreview: structuredKnowledge.slice(0, 300)
+    });
   }
 
-  if (method === 'POST' && path === '/api/delete-rag-doc') {
+  if (method === 'POST' && (path === '/api/delete-file' || path === '/api/delete-rag-doc')) {
     if (env.ZERNIO_KV) {
-      await env.ZERNIO_KV.delete('rag_doc_content');
-      await env.ZERNIO_KV.delete('rag_doc_meta');
+      await env.ZERNIO_KV.delete('store_files_content');
+      await env.ZERNIO_KV.delete('store_files_meta');
     }
-    return jsonResponse({ ok: true, message: 'تم مسح قاعدة المعرفة بنجاح' });
+    return jsonResponse({ ok: true, message: 'تم مسح ملفات المتجر وقاعدة المعرفة بنجاح' });
   }
 
-  // 10. 📊 تخصيص أعمدة الـ CRM
+  // 10. 📊 إدارة واسترجاع بيانات الـ CRM
   if (method === 'POST' && path === '/api/set-crm-schema') {
     const body = await request.json().catch(() => ({}));
     const schema = body.schema || '';
     if (env.ZERNIO_KV) await env.ZERNIO_KV.put('crm_custom_schema', schema);
-    return jsonResponse({ ok: true, message: 'تم تحديث هيكل وأعمدة الـ CRM بنجاح' });
+    return jsonResponse({ ok: true, message: 'تم تحديث أعمدة الـ CRM بنجاح' });
   }
 
   if (method === 'GET' && path === '/api/get-crm-schema') {
@@ -955,28 +997,51 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, schema: schema || 'الاسم، رقم الهاتف، العنوان، المنتج المطلوب' });
   }
 
+  // استرجاع كافة الطلبات والعملاء المسجلين في الـ CRM
+  if (method === 'GET' && path === '/api/crm/leads') {
+    if (!env.ZERNIO_KV) return jsonResponse({ ok: true, count: 0, leads: [] });
+    try {
+      const listRes = await env.ZERNIO_KV.list({ prefix: "crm_lead:", limit: 1000 });
+      const leads = (await Promise.all(listRes.keys.map((k) => kvGetJSON(env, k.name)))).filter(Boolean);
+      leads.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      return jsonResponse({ ok: true, count: leads.length, leads });
+    } catch (err) {
+      return jsonResponse({ ok: false, error: err.message }, 500);
+    }
+  }
+
+  if (method === 'POST' && path === '/api/crm/clear-leads') {
+    if (env.ZERNIO_KV) {
+      const listRes = await env.ZERNIO_KV.list({ prefix: "crm_lead:", limit: 1000 });
+      for (const k of listRes.keys) {
+        await env.ZERNIO_KV.delete(k.name);
+      }
+    }
+    return jsonResponse({ ok: true, message: 'تم تفريغ كافة سجلات الـ CRM بنجاح' });
+  }
+
   // 11. نظرة عامة للأدمن
   if (method === 'GET' && path === '/api/admin/overview') {
     const prompt = env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null;
-    const ragMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_meta') : null;
-    const ragContent = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_content') : null;
+    const filesMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('store_files_meta') : null;
+    const filesContent = env.ZERNIO_KV ? await env.ZERNIO_KV.get('store_files_content') : null;
     const crmSchema = env.ZERNIO_KV ? await env.ZERNIO_KV.get('crm_custom_schema') : null;
 
     return jsonResponse({
       ok: true,
-      service: "Bedaya Enterprise Agent Engine v23.0",
+      service: "Bedaya Enterprise Agent Engine v24.0",
       model: AI_ROUTER_MODEL,
       prompt: prompt || 'البرومبت الافتراضي نشط',
       crmSchema: crmSchema || 'افتراضي',
-      rag: {
-        active: !!ragContent,
-        meta: ragMeta ? JSON.parse(ragMeta) : null,
-        preview: ragContent ? ragContent.slice(0, 400) : null
+      files: {
+        active: !!filesContent,
+        meta: filesMeta ? JSON.parse(filesMeta) : null,
+        preview: filesContent ? filesContent.slice(0, 400) : null
       }
     });
   }
 
-  // 12. سجل تتبع الـ 3 أيام للوحة التحكم
+  // 12. سجل تتبع الـ 7 أيام
   if (method === 'GET' && path === '/api/audit-logs') {
     const logs = await listRecentLogs(env, { limit: 50 });
     return jsonResponse({ ok: true, count: logs.length, logs });
@@ -1043,6 +1108,7 @@ async function handleWebhook(request, env) {
     return textResponse("Invalid JSON body", 400);
   }
 
+  // إيداع الحدث مباشرة في طابور Cloudflare Queues بدون فحص Dedup
   if (env.EVENTS_QUEUE) {
     await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
   }
@@ -1109,7 +1175,7 @@ async function handleReviewQueue(request, env) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) تصميم صفحة الـ /dashboard المعتمدة (خلفية #f5f5f5 + كارت منحني 18px + اللوجو)
+// 9) تصميم صفحة الـ /dashboard المعتمدة (#f5f5f5 + اللوجو في المنتصف بالأعلى)
 // -----------------------------------------------------------------------------
 
 async function handleDashboard(request, env) {
@@ -1124,108 +1190,114 @@ async function handleDashboard(request, env) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>بِـدَايَــةٌ | لوحة المتابعة السحابية المباشرة (Dashboard)</title>
+<title>بِـدَايَــةٌ | غرفة المراقبة السحابية (Live Monitor)</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg-workspace: #f5f5f5;
-    --bg-surface: #ffffff;
-    --text-primary: #010101;
-    --text-secondary: #555555;
+    --bg-page: #f5f5f5;
+    --bg-card: #ffffff;
+    --text-pri: #010101;
+    --text-sec: #555555;
     --text-muted: #8e8e93;
-    --border: #e5e5e5;
+    --border-color: #e5e5e5;
     --green-bg: #ebfcd2;
-    --green-dark: #013330;
+    --green-text: #013330;
+    --green-border: #b4f0a0;
     --red-bg: #fef2f2;
     --red-text: #dc2626;
-    --radius-xl: 18px;
-    --radius-md: 8px;
+    --radius-workspace: 18px;
+    --radius-sm: 6px;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif !important; }
-  body { background-color: var(--bg-workspace); color: var(--text-primary); padding: 24px 16px; min-height: 100vh; display: flex; justify-content: center; }
-  .dashboard-container { width: 100%; max-width: 950px; display: flex; flex-direction: column; gap: 16px; }
-  .workspace-card { background-color: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 24px 28px; display: flex; flex-direction: column; gap: 18px; box-shadow: 0 4px 20px rgba(0,0,0,0.02); }
-  .brand-header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 16px; flex-wrap: wrap; gap: 12px; }
-  .logo-group { display: flex; align-items: center; gap: 12px; }
-  .logo-box { width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; }
-  .logo-box svg { width: 100%; height: 100%; }
-  .brand-name { font-size: 1.15rem; font-weight: 800; color: var(--text-primary); }
-  .brand-sub { font-size: 0.75rem; color: var(--text-muted); font-weight: 500; }
-  .stats-strip { display: flex; gap: 10px; flex-wrap: wrap; }
-  .pill { background-color: #f4f4f6; border: 1px solid var(--border); border-radius: 50px; padding: 6px 14px; font-size: 0.78rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
-  .pill-ok { background-color: var(--green-bg); color: var(--green-dark); border-color: #b4f0a0; }
-  .pill-err { background-color: var(--red-bg); color: var(--red-text); border-color: #fca5a5; }
-  .section-title { font-size: 0.92rem; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; }
-  .log-entry { background-color: #ffffff; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px 16px; display: flex; flex-direction: column; gap: 6px; }
-  .log-top { display: flex; align-items: center; justify-content: space-between; font-size: 0.78rem; }
-  .event-tag { font-weight: 700; color: var(--text-primary); }
-  .outcome-badge { padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; }
-  .out-final { background-color: var(--green-bg); color: var(--green-dark); }
-  .out-error, .out-internal-error, .out-max-steps { background-color: var(--red-bg); color: var(--red-text); }
-  .out-skipped-self-echo, .out-skipped-unsupported-event, .out-arrived { background-color: #f4f4f6; color: var(--text-muted); }
-  .log-msg { font-size: 0.82rem; color: var(--text-secondary); line-height: 1.5; background: #fafafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #f0f0f2; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif !important; box-shadow: none !important; -webkit-box-shadow: none !important; }
+  body { background-color: var(--bg-page); color: var(--text-pri); min-height: 100vh; padding: 0 6px 6px 6px; display: flex; flex-direction: column; align-items: center; }
+  .top-centered-brand { width: 100%; padding: 24px 0 16px 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
+  .logo-box-center { width: 50px; height: 50px; display: flex; align-items: center; justify-content: center; }
+  .logo-box-center svg { width: 100%; height: 100%; }
+  .workspace-container { width: 100%; max-width: 1050px; flex: 1; background-color: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-workspace); padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; margin-bottom: 2px; }
+  .status-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--border-color); }
+  .pills-group { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill { background-color: #f5f5f5; border: 1px solid var(--border-color); border-radius: 50px; padding: 5px 12px; font-size: 0.76rem; font-weight: 600; color: var(--text-sec); display: inline-flex; align-items: center; gap: 6px; }
+  .pill-ok { background-color: var(--green-bg); color: var(--green-text); border-color: var(--green-border); }
+  .stream-section { display: flex; flex-direction: column; gap: 12px; }
+  .stream-header { display: flex; align-items: center; justify-content: space-between; font-size: 0.88rem; font-weight: 700; color: var(--text-pri); }
+  .logs-list { display: flex; flex-direction: column; gap: 8px; }
+  .log-row { background-color: #ffffff; border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+  .log-row-top { display: flex; align-items: center; justify-content: space-between; font-size: 0.78rem; }
+  .event-label { font-weight: 700; color: var(--text-pri); }
+  .badge-outcome { padding: 2px 8px; border-radius: var(--radius-sm); font-size: 0.7rem; font-weight: 700; }
+  .badge-final { background-color: var(--green-bg); color: var(--green-text); }
+  .badge-err { background-color: var(--red-bg); color: var(--red-text); }
+  .badge-skip { background-color: #f5f5f5; color: var(--text-muted); }
+  .log-body-text { font-size: 0.82rem; color: var(--text-sec); line-height: 1.55; background-color: #fafafa; border: 1px solid #f0f0f0; padding: 8px 10px; border-radius: var(--radius-sm); }
 </style>
 </head>
 <body>
-<div class="dashboard-container">
-  <div class="workspace-card">
-    <div class="brand-header">
-      <div class="logo-group">
-        <div class="logo-box">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
-            <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#010101" stroke="#010101" stroke-width="2.7" stroke-linejoin="round" stroke-linecap="round"/>
-            <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#010101" stroke="#010101" stroke-width="2.0" stroke-linejoin="round" stroke-linecap="round"/>
-          </svg>
-        </div>
-        <div class="brand-title">
-          <span class="brand-name">بِـدَايَــةٌ | Bedaya Live Monitor</span>
-          <span class="brand-sub">غرفة المراقبة السحابية المباشرة للوكيل الذكي</span>
-        </div>
-      </div>
-      <div id="status-time" style="font-size:0.75rem; color:var(--text-muted);">بيحمل...</div>
+  <header class="top-centered-brand">
+    <div class="logo-box-center">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
+        <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#010101" stroke="#010101" stroke-width="2.7" stroke-linejoin="round" stroke-linecap="round"/>
+        <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#010101" stroke="#010101" stroke-width="2.0" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
     </div>
-    <div class="stats-strip" id="stats-bar"></div>
-    <div class="section-title">
-      <span>سجل تدفق الأحداث الحية (Real-time Stream)</span>
-      <span style="font-size:0.72rem; color:var(--text-muted);">يتحدث تلقائياً كل 5 ثوانٍ</span>
-    </div>
-    <div id="logs-container" style="display:flex; flex-direction:column; gap:8px;"></div>
-  </div>
-</div>
-<script>
-async function refresh() {
-  try {
-    const res = await fetch('/health${keyQs}');
-    const data = await res.json();
-    document.getElementById('status-time').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar-EG');
-    const zc = data.zernioRest && data.zernioRest.connected;
-    document.getElementById('stats-bar').innerHTML =
-      '<div class="pill ' + (zc ? 'pill-ok' : 'pill-err') + '">Zernio: ' + (zc ? '🟢 متصل' : '🔴 غير متصل') + '</div>' +
-      '<div class="pill">الحسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</div>' +
-      '<div class="pill">طابور المعالجة: نشط 100%</div>';
+  </header>
 
-    const logsEl = document.getElementById('logs-container');
-    const items = data.logs || [];
-    logsEl.innerHTML = items.map(function(e) {
-      const outcome = e.outcome || '';
-      return '<div class="log-entry">' +
-        '<div class="log-top"><span class="event-tag">' + esc(e.event || '') + ' — ' + esc(e.eventId || '') + '</span>' +
-        '<span class="outcome-badge out-' + esc(outcome) + '">' + esc(outcome) + '</span></div>' +
-        '<div style="font-size:0.75rem; color:var(--text-muted);">' + esc((e.timing && e.timing.receivedAt) || '') + (e.timing && typeof e.timing.durationMs === 'number' ? ' • ' + e.timing.durationMs + 'ms' : '') + '</div>' +
-        (e.finalText ? '<div class="log-msg">' + esc(e.finalText) + '</div>' : '') +
-        (e.error ? '<div class="log-msg" style="color:#dc2626;">' + esc(e.error) + '</div>' : '') +
-      '</div>';
-    }).join('') || '<div style="text-align:center; padding:16px; color:var(--text-muted);">لا توجد أحداث بعد</div>';
-  } catch (err) {
-    document.getElementById('status-time').textContent = 'فشل التحديث: ' + err.message;
+  <main class="workspace-container">
+    <section class="status-bar">
+      <div class="pills-group" id="stats-pills"></div>
+      <div id="live-clock" style="font-size:0.74rem; color:var(--text-muted); font-weight:600;">جاري التحميل...</div>
+    </section>
+
+    <section class="stream-section">
+      <div class="stream-header">
+        <span>سجل الرسائل والأحداث الواردة (Live Event Stream)</span>
+        <span id="events-count" style="font-size:0.75rem; color:var(--text-muted);">سجل 7 أيام</span>
+      </div>
+      <div class="logs-list" id="logs-container"></div>
+    </section>
+  </main>
+
+  <script>
+  async function refresh() {
+    try {
+      const res = await fetch('/health${keyQs}');
+      const data = await res.json();
+      document.getElementById('live-clock').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar-EG');
+      const zc = data.zernioRest && data.zernioRest.connected;
+      document.getElementById('stats-pills').innerHTML =
+        '<span class="pill ' + (zc ? 'pill-ok' : 'pill-err') + '">Zernio: ' + (zc ? '🟢 متصل' : '🔴 غير متصل') + '</span>' +
+        '<span class="pill">الحسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</span>' +
+        '<span class="pill">طابور المعالجة: نشط</span>' +
+        '<span class="pill">مدة السجل: 7 أيام</span>';
+
+      const logsEl = document.getElementById('logs-container');
+      const items = data.logs || [];
+      document.getElementById('events-count').textContent = items.length + ' حدث مسجل';
+      logsEl.innerHTML = items.map(function(e) {
+        const outcome = e.outcome || '';
+        let badgeClass = 'badge-skip';
+        if (outcome === 'final') badgeClass = 'badge-final';
+        else if (outcome === 'error' || outcome === 'max-steps') badgeClass = 'badge-err';
+
+        return '<div class="log-row">' +
+          '<div class="log-row-top">' +
+            '<span class="event-label">' + esc(e.event || '') + ' — ' + esc(e.eventId || '') + '</span>' +
+            '<span class="badge-outcome ' + badgeClass + '">' + esc(outcome) + '</span>' +
+          '</div>' +
+          '<div style="font-size:0.74rem; color:var(--text-muted);">' + esc((e.timing && e.timing.receivedAt) || '') + (e.timing && typeof e.timing.durationMs === 'number' ? ' • ' + e.timing.durationMs + 'ms' : '') + '</div>' +
+          (e.finalText ? '<div class="log-body-text">' + esc(e.finalText) + '</div>' : '') +
+          (e.error ? '<div class="log-body-text" style="color:#dc2626;">' + esc(e.error) + '</div>' : '') +
+        '</div>';
+      }).join('') || '<div style="text-align:center; padding:16px; color:var(--text-muted);">لا توجد أحداث مسجلة بعد</div>';
+    } catch (err) {
+      document.getElementById('live-clock').textContent = 'فشل المزامنة: ' + err.message;
+    }
   }
-}
-function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-refresh();
-setInterval(refresh, 5000);
-</script>
+  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  refresh();
+  setInterval(refresh, 5000);
+  </script>
 </body>
 </html>`;
 
@@ -1277,19 +1349,17 @@ export default {
     }
   },
 
-  // مستهلك الطوابير (معالجة إلزامية لـ DLQ لمنع موت الرسائل)
+  // مستهلك الطوابير (معالجة إلزامية لـ DLQ لضمان عدم سقوط أي رسالة)
   async queue(batch, env) {
-    // 1. طابور الـ Dead Letter Queue (المعالجة الإلزامية)
+    // 1. طابور الـ Dead Letter Queue (معالجة طارئة للرسائل المتعثرة)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
         const { rawBody, payload, receivedAt } = message.body || {};
         try {
-          // معالجة إلزامية طارئة للحدث حتى لا تسقط الرسالة
           await handleZernioEvent(env, rawBody, payload, receivedAt);
           message.ack();
         } catch (dlqErr) {
           console.error("DLQ Emergency handled event:", payload?.id, dlqErr.message);
-          // تسجيل نهائي في الـ Review Queue للمراجعة
           if (payload?.id) {
             await kvSetJSON(env, `review:${payload.id}`, {
               eventId: payload.id,
@@ -1305,7 +1375,7 @@ export default {
       return;
     }
 
-    // 2. الطابور الرئيسي مع التأخير التصاعدي
+    // 2. الطابور الرئيسي مع تأخير تصاعدي (10 محاولات)
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
@@ -1314,7 +1384,7 @@ export default {
       } catch (err) {
         console.error("queue consumer retry", payload && payload.id, err && err.message);
         const attempt = message.attempts || 1;
-        const delaySeconds = Math.min(30 * Math.pow(2, attempt - 1), 1800);
+        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800); // 20s, 40s, 80s... حتى 10 محاولات
         message.retry({ delaySeconds });
       }
     }
