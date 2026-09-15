@@ -1,6 +1,5 @@
 // =============================================================================
-// Bedaya Enterprise Social Inbox Agent (v25.0: Telegram & Gmail Direct Hub)
-// Worker URL: https://automation.nckalo018.workers.dev
+// Bedaya Enterprise Agent (v25.0: Native Telegram Bot API + Zernio + Custom CRM)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -10,17 +9,19 @@ const DEFAULT_ADMIN_KEY = "bedaya_admin_2026";
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
+const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 // الثوابت التشغيلية
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام
 const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام
+const TG_HISTORY_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام لسياق تليجرام
 const LOG_LIST_LIMIT = 50;
 
 const MAX_AGENT_STEPS = 10;
 const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
-const AUTO_CONTEXT_LIMIT = 10; // سياق آخر 10 رسائل
+const AUTO_CONTEXT_LIMIT = 10;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -66,6 +67,7 @@ async function kvGetJSON(env, key) {
     const raw = await env.ZERNIO_KV.get(key);
     return raw ? JSON.parse(raw) : null;
   } catch (err) {
+    console.error("kvGetJSON failed", key, err);
     return null;
   }
 }
@@ -73,7 +75,9 @@ async function kvGetJSON(env, key) {
 async function kvSetJSON(env, key, value, ttlSeconds) {
   try {
     await env.ZERNIO_KV.put(key, JSON.stringify(value), ttlSeconds ? { expirationTtl: ttlSeconds } : undefined);
-  } catch (err) {}
+  } catch (err) {
+    console.error("kvSetJSON failed", key, err);
+  }
 }
 
 function isoNow() { return new Date().toISOString(); }
@@ -116,6 +120,7 @@ async function listRecentLogs(env, { limit = LOG_LIST_LIMIT, eventId = null, sin
     }
     return needsWideScan ? entries : entries.slice(0, limit);
   } catch (err) {
+    console.error("listRecentLogs failed", err);
     return [];
   }
 }
@@ -126,7 +131,54 @@ function redactSecret(text, secret) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) بوابات الإرسال المباشرة لـ Telegram و Gmail و Zernio
+// 2) محرك الربط المباشر مع Telegram Bot API
+// -----------------------------------------------------------------------------
+
+async function getTelegramBotToken(env) {
+  if (env.TELEGRAM_BOT_TOKEN) return env.TELEGRAM_BOT_TOKEN.trim();
+  if (env.ZERNIO_KV) {
+    const saved = await env.ZERNIO_KV.get("telegram_bot_token");
+    if (saved) return saved.trim();
+  }
+  return "";
+}
+
+async function telegramFetch(env, method, body = {}) {
+  const token = await getTelegramBotToken(env);
+  if (!token) return { ok: false, status: 0, data: { error: "Telegram Bot Token is missing" } };
+
+  const url = `${TELEGRAM_API_BASE}/bot${token}/${method}`;
+  const res = await Promise.race([
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Telegram API Timeout")), CALL_TIMEOUT_MS))
+  ]);
+
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok && data.ok, status: res.status, data };
+}
+
+async function recordTelegramHistory(env, chatId, senderName, text) {
+  if (!env.ZERNIO_KV || !chatId || !text) return;
+  try {
+    const key = `tg_history:${chatId}`;
+    let history = (await kvGetJSON(env, key)) || [];
+    history.push({ sender: senderName, message: text, time: isoNow() });
+    if (history.length > 10) history = history.slice(-10);
+    await kvSetJSON(env, key, history, TG_HISTORY_TTL_SECONDS);
+  } catch (_) {}
+}
+
+async function getTelegramHistory(env, chatId) {
+  if (!env.ZERNIO_KV || !chatId) return [];
+  return (await kvGetJSON(env, `tg_history:${chatId}`)) || [];
+}
+
+// -----------------------------------------------------------------------------
+// 3) كتالوج أدوات الوكيل (Zernio + Telegram + CRM + Spam Tool)
 // -----------------------------------------------------------------------------
 
 async function zernioFetch(env, path, options = {}) {
@@ -140,62 +192,27 @@ async function zernioFetch(env, path, options = {}) {
   const res = await Promise.race([
     fetch(url, { ...options, headers }),
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`انتهت مهلة نداء Zernio API: ${path}`)), CALL_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`انتهت مهلة اتصال Zernio API: ${path}`)), CALL_TIMEOUT_MS)
     ),
   ]);
   const bodyText = await res.text();
   let data;
-  try { data = bodyText ? JSON.parse(bodyText) : {}; } catch (_) { data = { raw: bodyText.slice(0, 500) }; }
+  try {
+    data = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_) {
+    data = { raw: bodyText.slice(0, 500) };
+  }
   return { ok: res.ok, status: res.status, data };
 }
-
-// إرسال مباشر لتليجرام بدون Zernio
-async function sendTelegramDirect(env, chatId, text) {
-  const token = (env.TELEGRAM_BOT_TOKEN || (await env.ZERNIO_KV?.get("telegram_bot_token")) || "").trim();
-  if (!token) return { ok: false, status: 400, data: { error: "TELEGRAM_BOT_TOKEN غير مضبوط بالسيرفر" } };
-
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text })
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, status: res.status, data };
-}
-
-// إرسال مباشر لـ Gmail عبر Google Apps Script
-async function sendGmailDirect(env, threadId, text, metadata = {}) {
-  const scriptUrl = (env.GMAIL_SCRIPT_URL || (await env.ZERNIO_KV?.get("gmail_script_url")) || metadata.appsScriptCallbackUrl || "").trim();
-  if (!scriptUrl) return { ok: false, status: 400, data: { error: "رابط Google Apps Script لـ Gmail غير مضبوط" } };
-
-  const res = await fetch(scriptUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      action: "reply",
-      threadId: threadId || metadata.threadId,
-      toEmail: metadata.fromEmail,
-      subject: metadata.subject ? `Re: ${metadata.subject.replace(/^Re:\s*/i, '')}` : "رد خدمة العملاء",
-      replyBody: text
-    })
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, status: res.status, data };
-}
-
-// -----------------------------------------------------------------------------
-// 3) كتالوج أدوات الوكيل (Tools Handlers الموحدة لكل المنصات)
-// -----------------------------------------------------------------------------
 
 function missingArgsError(names) {
   return { ok: false, status: 0, data: { error: `الحقول المطلوبة مفقودة: ${names.join(", ")}` } };
 }
 
 const TOOL_DESCRIPTIONS = {
-  listMessages: "جلب آخر رسائل محادثة DM (سياق)",
-  sendMessage: "إرسال رسالة DM مباشرة للعميل (Meta, TikTok, Telegram, Gmail)",
-  typingIndicator: "مؤشر الكتابة التلقائي",
+  listMessages: "جلب سياق الرسائل السابقة للمحادثة",
+  sendMessage: "إرسال رسالة DM مباشرة للعميل (Meta, TikTok, أو Telegram)",
+  typingIndicator: "مؤشر الكتابة التلقائي (Typing)",
   addReaction: "إضافة تفاعل Reaction على رسالة DM",
   removeReaction: "إزالة تفاعل Reaction من رسالة DM",
   listComments: "جلب تعليقات البوست (سياق)",
@@ -203,35 +220,43 @@ const TOOL_DESCRIPTIONS = {
   sendPrivateReply: "إرسال DM خاص لصاحب تعليق",
   deleteComment: "حذف تعليق",
   ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام أو الإعلانات المزعجة)",
-  saveToCrm: "تسجيل وحفظ بيانات العميل والطلب في نظام علاقات العملاء (CRM)",
+  saveToCrm: "تسجيل وحفظ بيانات العميل والطلب في نظام الـ CRM",
 };
 
 const CALL_HANDLERS = {
   async listMessages(env, args) {
     const { conversationId, accountId, limit = AUTO_CONTEXT_LIMIT, sortOrder = "desc", cursor } = args || {};
-    if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
-    const qs = new URLSearchParams({ accountId, limit: String(limit), sortOrder });
+    if (!conversationId) return missingArgsError(["conversationId"]);
+    
+    // إذا كانت المحادثة على تليجرام
+    if (args.platform === 'telegram' || accountId === 'telegram_bot') {
+      const history = await getTelegramHistory(env, conversationId);
+      return { ok: true, status: 200, data: { messages: history } };
+    }
+
+    const qs = new URLSearchParams({ accountId: accountId || "", limit: String(limit), sortOrder });
     if (cursor) qs.set("cursor", cursor);
     return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages?${qs}`, { method: "GET" });
   },
 
-  // أداة الإرسال الموحدة الذكية: تكتشف المنصة وتوجه الرسالة للمسار الصحيح
   async sendMessage(env, args, idempotencyKey) {
-    const { conversationId, accountId, message, attachmentUrl, attachmentType, platform, metadata } = args || {};
-    if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
+    const { conversationId, accountId, message, attachmentUrl, attachmentType, platform } = args || {};
+    if (!conversationId) return missingArgsError(["conversationId"]);
     if (!message && !attachmentUrl) return missingArgsError(["message أو attachmentUrl"]);
 
-    // 1. إذا كان الحساب تليجرام
-    if (platform === "telegram" || accountId === "telegram_bot") {
-      return sendTelegramDirect(env, conversationId, message);
+    // إذا كانت المنصة Telegram
+    if (platform === 'telegram' || accountId === 'telegram_bot') {
+      const tgRes = await telegramFetch(env, "sendMessage", {
+        chat_id: conversationId,
+        text: message
+      });
+      if (tgRes.ok) {
+        await recordTelegramHistory(env, conversationId, "الوكيل الذكي", message);
+      }
+      return tgRes;
     }
 
-    // 2. إذا كان الحساب جيميل
-    if (platform === "gmail" || accountId === "gmail_inbox") {
-      return sendGmailDirect(env, conversationId, message, metadata);
-    }
-
-    // 3. منصات Zernio (Meta & TikTok)
+    // المنصات الأخرى (Meta, TikTok عبر Zernio)
     const body = { accountId };
     if (message) body.message = message;
     if (attachmentUrl) {
@@ -248,8 +273,12 @@ const CALL_HANDLERS = {
 
   async typingIndicator(env, args) {
     const { conversationId, accountId, platform } = args || {};
-    if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
-    if (platform === "telegram" || platform === "gmail") return { ok: true, data: { status: "skipped" } };
+    if (!conversationId) return missingArgsError(["conversationId"]);
+
+    if (platform === 'telegram' || accountId === 'telegram_bot') {
+      return telegramFetch(env, "sendChatAction", { chat_id: conversationId, action: "typing" });
+    }
+
     return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/typing`, {
       method: "POST",
       body: JSON.stringify({ accountId }),
@@ -282,11 +311,13 @@ const CALL_HANDLERS = {
   },
 
   async listComments(env, args) {
-    const { postId, accountId, limit, cursor } = args || {};
+    const { postId, accountId, limit, cursor, subreddit, commentId } = args || {};
     if (!postId || !accountId) return missingArgsError(["postId (platformPostId)", "accountId"]);
     const qs = new URLSearchParams({ accountId });
     if (limit) qs.set("limit", String(limit));
     if (cursor) qs.set("cursor", cursor);
+    if (subreddit) qs.set("subreddit", subreddit);
+    if (commentId) qs.set("commentId", commentId);
     return zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}?${qs}`, { method: "GET" });
   },
 
@@ -305,11 +336,13 @@ const CALL_HANDLERS = {
   },
 
   async sendPrivateReply(env, args, idempotencyKey) {
-    const { postId, commentId, accountId, message } = args || {};
+    const { postId, commentId, accountId, message, quickReplies, buttons } = args || {};
     if (!postId || !commentId || !accountId || !message) {
       return missingArgsError(["postId (platformPostId)", "commentId", "accountId", "message"]);
     }
     const body = { accountId, message };
+    if (quickReplies) body.quickReplies = quickReplies;
+    if (buttons) body.buttons = buttons;
     const headers = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined;
     return zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}/${encodeURIComponent(commentId)}/private-reply`, {
       method: "POST",
@@ -343,7 +376,7 @@ const CALL_HANDLERS = {
     return {
       ok: true,
       status: 200,
-      data: { action: "saved_to_crm", leadData, message: "تم تسجيل وحفظ بيانات العميل في الـ CRM بنجاح." }
+      data: { action: "saved_to_crm", leadData, message: "تم تسجيل بيانات العميل في الـ CRM بنجاح." }
     };
   }
 };
@@ -390,7 +423,7 @@ async function executeCalls(env, calls, eventId) {
 // -----------------------------------------------------------------------------
 
 async function buildAgentSystemInstruction(env) {
-  let customPrompt = "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات والإيميلات باحترافية وسرعة.";
+  let customPrompt = "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages وعلى التعليقات (فيسبوك، انستجرام، تيك توك، وتليجرام) باحترافية وسرعة.";
   let filesSection = "";
   let crmSection = "";
 
@@ -415,22 +448,23 @@ async function buildAgentSystemInstruction(env) {
     filesSection,
     crmSection,
     "=== قواعد عمل نظام الوكيل والرد ===",
-    "أنت وكيل ذكي بيرد على رسائل الـ DMs والتعليقات والإيميلات (Instagram, Facebook, TikTok, Telegram, Gmail).",
-    "حدثين أساسيين: event = \"message.received\" أو event = \"comment.received\".",
+    "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات الواردة من (Instagram, Facebook, TikTok, و Telegram المباشر).",
+    "حدثين بس: event = \"message.received\" (رسالة DM) أو event = \"comment.received\" (تعليق على بوست أو فيديو).",
     "",
     "طريقة الرد الإلزامية: كل رد منك لازم يكون كائن JSON واحد فقط:",
     '1) {"action": "call", "calls": [{"name": "اسم العملية", "args": {...}}], "done": true}',
     '2) {"action": "final", "text": "..."}',
     "",
     "القواعد:",
-    "1. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
-    "2. عند إتمام اتفاق أو طلب مع العميل وجمع بياناته: استخدم أداة saveToCrm لتسجيل البيانات في الـ CRM.",
-    "3. في أداة sendMessage: مرر دائماً نفس conversationId و accountId ونفس platform و metadata المستخرجة من الحدث لضمان وصول الرد للمنصة الصحيحة.",
+    "1. إذا كانت المنصة Telegram: استخدم أداة sendMessage وضع platform: \"telegram\" و conversationId يمثل chat_id.",
+    "2. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
+    "3. عند إتمام اتفاق أو طلب مع العميل وجمع بياناته: استخدم أداة saveToCrm لتسجيل البيانات في الـ CRM.",
     "",
-    "── كتالوج أدوات الـ DM والإيميل (event = message.received) ──",
-    '- sendMessage — args: { conversationId, accountId, platform, metadata?, message, attachmentUrl? }',
+    "── كتالوج أدوات الـ DM (event = message.received) ──",
+    '- sendMessage — args: { conversationId, accountId, message, attachmentUrl?, platform? }',
     '- addReaction — args: { conversationId, accountId, messageId, emoji }',
-    '- listMessages — args: { conversationId, accountId, limit? }',
+    '- removeReaction — args: { conversationId, accountId, messageId }',
+    '- listMessages — args: { conversationId, accountId, limit?, sortOrder?, platform? }',
     '- ignoreMessage — args: { reason ("spam"|"offensive"|"no_action_needed"), notes? }',
     '- saveToCrm — args: { leadData: { ... } }',
     "",
@@ -440,13 +474,13 @@ async function buildAgentSystemInstruction(env) {
     '- ignoreMessage — args: { reason ("spam"|"offensive"|"no_action_needed"), notes? }',
     "",
     "طريقة عملك:",
-    "1. حدد نوع الحدث والمنصة واستخرج الـ IDs بالظبط من النص الوارد.",
+    "1. حدد نوع الحدث واستخرج الـ IDs الحقيقية بالظبط من النص الوارد.",
     "2. لو العملية هي آخر حاجة مطلوبة، استخدم done:true لإنهاء المعالجة فوراً."
   ].filter(Boolean).join("\n");
 }
 
 // -----------------------------------------------------------------------------
-// 5) عميل الموديل ومحلل الملفات الذكي (AI Router & File Synthesizer)
+// 5) عميل الموديل ومحلل الملفات (AI Router & File Synthesizer)
 // -----------------------------------------------------------------------------
 
 function contentsToMessages(systemInstruction, contents) {
@@ -488,7 +522,7 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
         }),
       }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`انتهت مهلة نداء AI Router (${AI_CALL_TIMEOUT_MS / 1000}s)`)), AI_CALL_TIMEOUT_MS)
+        setTimeout(() => reject(new Error(`انتهت مهلة نداء AI Router`)), AI_CALL_TIMEOUT_MS)
       ),
     ]);
     bodyText = await res.text();
@@ -508,10 +542,19 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
     throw new Error(msg);
   }
 
+  if (attemptsLog) {
+    attemptsLog.push({
+      provider: "ai-router",
+      model: AI_ROUTER_MODEL,
+      status: res.status,
+      ok: true,
+      upstreamProvider: res.headers.get("X-AI-Router-Provider") || null,
+      upstreamModel: res.headers.get("X-AI-Router-Model") || null,
+    });
+  }
   return extractRouterText(data);
 }
 
-// تحليل محتوى الملفات وفهمها بالـ AI Router
 async function synthesizeStoreKnowledge(env, rawFileText, fileName) {
   const prompt = `أنت خبير تحليل بيانات الأنشطة التجارية والمتاجر. قم بقراءة وفهم محتوى هذا الملف (${fileName}) واستخرج منه جميع المعلومات الأساسية للمتجر (المنتجات، الأسعار، العروض، سياسات الشحن والضمان، والأسئلة الشائعة). قم بتلخيصها وصياغتها في شكل قاعدة معرفة واضحة ومباشرة ومنظمة باللغة العربية.
 
@@ -542,6 +585,7 @@ ${rawFileText.slice(0, 15000)}
     const data = await res.json();
     return extractRouterText(data).trim();
   } catch (err) {
+    console.error("File synthesis error, fallback to raw text:", err);
     return rawFileText.slice(0, 5000);
   }
 }
@@ -663,7 +707,7 @@ async function runAgentLoop(env, rawEventText, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 7) معالجة أحداث الويب هوك (Zernio, Telegram, Gmail)
+// 7) معالجة الأحداث الواردة (Zernio + Telegram)
 // -----------------------------------------------------------------------------
 
 function isSelfEcho(payload) {
@@ -688,7 +732,8 @@ function extractAccountId(payload) {
 function extractMessageContext(payload) {
   const conversationId = payload.message && payload.message.conversationId;
   const accountId = extractAccountId(payload);
-  return conversationId && accountId ? { conversationId, accountId } : null;
+  const platform = payload.account && payload.account.platform;
+  return conversationId ? { conversationId, accountId, platform } : null;
 }
 
 function extractCommentContext(payload) {
@@ -698,7 +743,7 @@ function extractCommentContext(payload) {
   return postId && accountId ? { postId, accountId } : null;
 }
 
-async function handleUnifiedEvent(env, rawBody, payload, receivedAt) {
+async function handleZernioEvent(env, rawBody, payload, receivedAt) {
   const eventId = payload.id;
   const eventType = payload.event;
   const startedAt = isoNow();
@@ -733,20 +778,18 @@ async function handleUnifiedEvent(env, rawBody, payload, receivedAt) {
     let rawEventText = rawBody;
     let contextFetched = null;
 
-    // فحص الملاحظات الصوتية
-    const audioAttachment = (payload.message?.attachments || []).find(a => a.type === 'audio' || a.originalType === 'audio');
-    if (audioAttachment && audioAttachment.url) {
-      rawEventText += `\n\n[ملاحظة صوتية واردة من العميل]: مرفق ملف صوتي في الرابط: ${audioAttachment.url}`;
-    }
-
     if (eventType === "message.received") {
       const ids = extractMessageContext(payload);
-      // جلب السياق فقط لمنصات Zernio
-      if (ids && payload.account?.platform !== "telegram" && payload.account?.platform !== "gmail") {
+      if (ids) {
         CALL_HANDLERS.typingIndicator(env, ids).catch(() => {});
         const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" });
         contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
         rawEventText += `\n\nسياق آخر الرسائل:\n${JSON.stringify(history.data).slice(0, 2500)}`;
+
+        // تسجيل الرسالة الواردة في تاريخ تليجرام لو المنصة تليجرام
+        if (ids.platform === 'telegram') {
+          await recordTelegramHistory(env, ids.conversationId, payload.message?.sender?.name || "العميل", payload.message?.text || "");
+        }
       }
     } else if (eventType === "comment.received") {
       const ids = extractCommentContext(payload);
@@ -787,6 +830,7 @@ async function handleUnifiedEvent(env, rawBody, payload, receivedAt) {
   } catch (err) {
     const finishedAt = isoNow();
     const errMsg = redactSecret(String((err && err.message) || err), apiKey);
+    console.error("handleZernioEvent error", eventId, err);
     if (!errMsg.startsWith("retry-requested:")) {
       await logActivity(env, {
         eventId,
@@ -808,7 +852,7 @@ async function handleUnifiedEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 8) مسارات الـ API الشاملة
+// 8) مسارات الـ API (OAuth, Telegram, CRM, Files, Factory Reset)
 // -----------------------------------------------------------------------------
 
 async function handleApiRequests(request, env, url) {
@@ -832,29 +876,92 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 2. الحسابات المتصلة وفصل الحساب
+  // 2. الحسابات المتصلة وفصل حساب محدد
   if (method === 'GET' && path === '/api/accounts') {
     const zernioRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
-    return jsonResponse(zernioRes.data, zernioRes.status);
+    const data = zernioRes.data;
+    
+    // إضافة حساب تليجرام لو التوكن موجود
+    const tgToken = await getTelegramBotToken(env);
+    if (tgToken) {
+      const accountsList = Array.isArray(data) ? data : (data.accounts || []);
+      accountsList.push({
+        id: "telegram_bot",
+        name: "Telegram Bot المباشر",
+        username: "TelegramBot",
+        platform: "telegram",
+        isActive: true
+      });
+      return jsonResponse({ ok: true, accounts: accountsList });
+    }
+
+    return jsonResponse(data, zernioRes.status);
   }
 
   if (method === 'DELETE' && path.startsWith('/api/accounts/')) {
     const accountId = path.split('/api/accounts/')[1];
     if (!accountId) return jsonResponse({ error: 'accountId مطلوب' }, 400);
 
+    if (accountId === 'telegram_bot') {
+      if (env.ZERNIO_KV) await env.ZERNIO_KV.delete("telegram_bot_token");
+      await telegramFetch(env, "deleteWebhook");
+      return jsonResponse({ ok: true, message: "تم فصل بوت تليجرام وإلغاء الويب هوك بنجاح." });
+    }
+
     const zernioRes = await zernioFetch(env, `/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
     if (zernioRes.ok || zernioRes.status === 404) return jsonResponse({ ok: true, message: 'تم فصل الحساب بنجاح من Zernio' });
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 3. الفرمتة الشاملة المحمية بمفتاح الآدمن
+  // 3. 🤖 مسارات إدارة بوت تليجرام المباشر (Telegram Native Integration)
+  if (method === 'POST' && path === '/api/telegram/set-token') {
+    const body = await request.json().catch(() => ({}));
+    const token = (body.token || '').trim();
+    if (!token) return jsonResponse({ error: 'حقل token مطلوب' }, 400);
+
+    if (env.ZERNIO_KV) await env.ZERNIO_KV.put("telegram_bot_token", token);
+    
+    // فحص صلاحية التوكن مباشرة مع تليجرام
+    const meRes = await telegramFetch(env, "getMe");
+    return jsonResponse({
+      ok: meRes.ok,
+      message: meRes.ok ? `تم حفظ توكن تليجرام بنجاح للبوت: @${meRes.data?.result?.username}` : "تم حفظ التوكن ولكن تليجرام رفض الاتصال",
+      bot: meRes.data?.result
+    });
+  }
+
+  if (method === 'GET' && path === '/api/telegram/me') {
+    const meRes = await telegramFetch(env, "getMe");
+    return jsonResponse(meRes.data, meRes.status);
+  }
+
+  if (method === 'POST' && path === '/api/telegram/setup-webhook') {
+    const workerUrl = url.origin;
+    const webhookUrl = `${workerUrl}/webhook/telegram`;
+    const tgRes = await telegramFetch(env, "setWebhook", {
+      url: webhookUrl,
+      drop_pending_updates: true
+    });
+    return jsonResponse({
+      ok: tgRes.ok,
+      message: tgRes.ok ? `تم ضبط وتفعيل الويب هوك على تليجرام بنجاح: ${webhookUrl}` : "فشل ضبط الويب هوك في تليجرام",
+      telegramResponse: tgRes.data
+    });
+  }
+
+  if (method === 'POST' && path === '/api/telegram/delete-webhook') {
+    const tgRes = await telegramFetch(env, "deleteWebhook");
+    return jsonResponse(tgRes.data);
+  }
+
+  // 4. 🧹 الفرمتة الشاملة للسيرفر المحمية بمفتاح الآدمن
   if (method === 'POST' && path === '/api/admin/factory-reset') {
     const body = await request.json().catch(() => ({}));
     const providedKey = request.headers.get("X-Admin-Key") || body.adminKey || url.searchParams.get("key");
     const validKey = env.STATUS_KEY || env.ADMIN_KEY || DEFAULT_ADMIN_KEY;
 
     if (providedKey !== validKey) {
-      return jsonResponse({ error: "غير مصرح: مفتاح الآدمن (Admin Key) غير صحيح أو مفقود." }, 401);
+      return jsonResponse({ error: "غير مصرح: مفتاح الآدمن غير صحيح أو مفقود." }, 401);
     }
 
     const disconnectedAccounts = [];
@@ -868,7 +975,12 @@ async function handleApiRequests(request, env, url) {
           disconnectedAccounts.push({ id, name: acc.name || acc.username || acc.platform });
         }
       }
-    } catch (e) {}
+      // إلغاء تليجرام
+      await telegramFetch(env, "deleteWebhook");
+      disconnectedAccounts.push({ id: "telegram_bot", name: "Telegram Bot" });
+    } catch (e) {
+      console.error("Factory reset accounts error:", e);
+    }
 
     let deletedKeysCount = 0;
     if (env.ZERNIO_KV) {
@@ -882,34 +994,22 @@ async function handleApiRequests(request, env, url) {
           }
           cursor = listRes.cursor;
         } while (cursor);
-      } catch (kvErr) {}
+      } catch (kvErr) {
+        console.error("Factory reset KV error:", kvErr);
+      }
     }
 
     return jsonResponse({
       ok: true,
       message: "تمت فرمتة السيرفر وحذف جميع الحسابات وبيانات الـ KV بالكامل.",
       deletedAccountsCount: disconnectedAccounts.length,
+      disconnectedAccounts,
       deletedKvKeysCount: deletedKeysCount,
       resetAt: isoNow()
     });
   }
 
-  // 4. ضبط توكن تليجرام المباشر ورابط سكريبت جيميل
-  if (method === 'POST' && path === '/api/telegram/set-token') {
-    const body = await request.json().catch(() => ({}));
-    if (!body.token) return jsonResponse({ error: "حقل token مفقود" }, 400);
-    if (env.ZERNIO_KV) await env.ZERNIO_KV.put("telegram_bot_token", body.token.trim());
-    return jsonResponse({ ok: true, message: "تم حفظ رمز بوت تليجرام بنجاح" });
-  }
-
-  if (method === 'POST' && path === '/api/gmail/set-script-url') {
-    const body = await request.json().catch(() => ({}));
-    if (!body.url) return jsonResponse({ error: "حقل url مفقود" }, 400);
-    if (env.ZERNIO_KV) await env.ZERNIO_KV.put("gmail_script_url", body.url.trim());
-    return jsonResponse({ ok: true, message: "تم حفظ رابط سكريبت جيميل بنجاح" });
-  }
-
-  // 5. مسارات OAuth فيسبوك وإنستغرام وتيك توك
+  // 5. مسارات OAuth فيسبوك
   if (method === 'GET' && path === '/api/auth/facebook') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -921,8 +1021,10 @@ async function handleApiRequests(request, env, url) {
     const tempToken = url.searchParams.get('tempToken');
     const connectToken = url.searchParams.get('connect_token') || request.headers.get('x-connect-token') || '';
     if (!tempToken) return jsonResponse({ error: 'tempToken مطلوب' }, 400);
+
     const headers = { Authorization: `Bearer ${API_KEY}` };
     if (connectToken) headers['X-Connect-Token'] = connectToken;
+
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook/select-page?profileId=${PROFILE_ID}&tempToken=${encodeURIComponent(tempToken)}`;
     const res = await fetch(zernioUrl, { headers });
     return jsonResponse(await res.json().catch(() => ({})), res.status);
@@ -934,10 +1036,12 @@ async function handleApiRequests(request, env, url) {
     const connectToken = body.connect_token || request.headers.get('x-connect-token') || '';
     const headers = { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' };
     if (connectToken) headers['X-Connect-Token'] = connectToken;
+
     const res = await fetch(`${ZERNIO_API_BASE}/connect/facebook/select-page`, { method: 'POST', headers, body: JSON.stringify(body) });
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
+  // 6. مسارات OAuth إنستغرام
   if (method === 'GET' && path === '/api/auth/instagram') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
@@ -964,6 +1068,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
+  // 7. مسار OAuth تيك توك
   if (method === 'GET' && path === '/api/auth/tiktok') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/tiktok?profileId=${PROFILE_ID}&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -971,7 +1076,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 6. البرومبت والملفات الذكية
+  // 8. البرومبت
   if (method === 'POST' && path === '/api/set-prompt') {
     const body = await request.json().catch(() => ({}));
     if (!body.prompt) return jsonResponse({ error: 'حقل prompt مفقود' }, 400);
@@ -984,19 +1089,21 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
+  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Files Knowledge)
   if (method === 'POST' && (path === '/api/upload-file' || path === '/api/upload-rag-doc')) {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
     if (!textContent) return jsonResponse({ error: 'محتوى الملف مفقود' }, 400);
 
-    const structuredKnowledge = await synthesizeStoreKnowledge(env, textContent, name || "مستند المتجر");
+    const structuredKnowledge = await synthesizeStoreKnowledge(env, textContent, name || "ملف المتجر");
+
     if (env.ZERNIO_KV) {
       await env.ZERNIO_KV.put('store_files_content', structuredKnowledge);
       await env.ZERNIO_KV.put('store_files_meta', JSON.stringify({ name, size, updatedAt: isoNow() }));
     }
     return jsonResponse({
       ok: true,
-      message: `تم تحليل وفهم محتوى ملف (${name}) ودمجه بنجاح!`,
+      message: `تم تحليل وفهم محتوى ملف (${name}) ودمجه في معرفة الوكيل بنجاح!`,
       synthesizedPreview: structuredKnowledge.slice(0, 300)
     });
   }
@@ -1006,10 +1113,10 @@ async function handleApiRequests(request, env, url) {
       await env.ZERNIO_KV.delete('store_files_content');
       await env.ZERNIO_KV.delete('store_files_meta');
     }
-    return jsonResponse({ ok: true, message: 'تم مسح ملفات المتجر وقاعدة المعرفة بنجاح' });
+    return jsonResponse({ ok: true, message: 'تم مسح ملفات المتجر بنجاح' });
   }
 
-  // 7. الـ CRM
+  // 10. 📊 الـ CRM (تخصيص الأعمدة + استرجاع ومسح الطلبات)
   if (method === 'POST' && path === '/api/set-crm-schema') {
     const body = await request.json().catch(() => ({}));
     const schema = body.schema || '';
@@ -1037,22 +1144,26 @@ async function handleApiRequests(request, env, url) {
   if (method === 'POST' && path === '/api/crm/clear-leads') {
     if (env.ZERNIO_KV) {
       const listRes = await env.ZERNIO_KV.list({ prefix: "crm_lead:", limit: 1000 });
-      for (const k of listRes.keys) await env.ZERNIO_KV.delete(k.name);
+      for (const k of listRes.keys) {
+        await env.ZERNIO_KV.delete(k.name);
+      }
     }
-    return jsonResponse({ ok: true, message: 'تم تفريغ سجلات الـ CRM بنجاح' });
+    return jsonResponse({ ok: true, message: 'تم تفريغ كافة سجلات الـ CRM بنجاح' });
   }
 
-  // 8. نظرة عامة وسجلات التدفق
+  // 11. نظرة عامة للأدمن
   if (method === 'GET' && path === '/api/admin/overview') {
     const prompt = env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null;
     const filesMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('store_files_meta') : null;
     const filesContent = env.ZERNIO_KV ? await env.ZERNIO_KV.get('store_files_content') : null;
     const crmSchema = env.ZERNIO_KV ? await env.ZERNIO_KV.get('crm_custom_schema') : null;
+    const tgToken = await getTelegramBotToken(env);
 
     return jsonResponse({
       ok: true,
       service: "Bedaya Enterprise Agent Engine v25.0",
       model: AI_ROUTER_MODEL,
+      telegramConnected: !!tgToken,
       prompt: prompt || 'البرومبت الافتراضي نشط',
       crmSchema: crmSchema || 'افتراضي',
       files: {
@@ -1063,12 +1174,13 @@ async function handleApiRequests(request, env, url) {
     });
   }
 
+  // 12. سجل تتبع الـ 7 أيام
   if (method === 'GET' && path === '/api/audit-logs') {
     const logs = await listRecentLogs(env, { limit: 50 });
     return jsonResponse({ ok: true, count: logs.length, logs });
   }
 
-  // 9. اختبار الشات
+  // 13. اختبار الشات والمحاكاة المباشرة
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار المتاحة؟';
@@ -1097,156 +1209,93 @@ async function handleApiRequests(request, env, url) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) استقبال الـ Webhooks (Zernio, Telegram, Gmail) وإيداعها في الطابور
+// 9) استقبال الـ Webhooks (Zernio + Telegram)
 // -----------------------------------------------------------------------------
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+async function handleZernioWebhook(request, env) {
+  const receivedAt = isoNow();
+  const rawBody = await request.text();
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+  await logActivity(env, {
+    event: "webhook-received",
+    outcome: "arrived",
+    timing: { receivedAt },
+    hasSignatureHeader: !!request.headers.get("X-Zernio-Signature"),
+    bodyPreview: rawBody.length > 200 ? rawBody.slice(0, 200) + "…" : rawBody,
+  });
+
+  const signature = request.headers.get("X-Zernio-Signature");
+  if (signature && env.ZERNIO_WEBHOOK_SECRET) {
+    const computed = await hmacSha256Hex(env.ZERNIO_WEBHOOK_SECRET, rawBody);
+    if (!safeEqualHex(computed, signature)) {
+      await logActivity(env, { event: "webhook", outcome: "rejected-bad-signature", timing: { receivedAt } });
+      return textResponse("Invalid signature", 400);
     }
+  }
 
-    try {
-      if (url.pathname.startsWith("/api/")) {
-        return await handleApiRequests(request, env, url);
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (err) {
+    await logActivity(env, { event: "webhook", outcome: "rejected-invalid-json", error: err.message, timing: { receivedAt } });
+    return textResponse("Invalid JSON body", 400);
+  }
+
+  if (env.EVENTS_QUEUE) {
+    await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
+  }
+
+  return jsonResponse({ ok: true, queued: true });
+}
+
+// معالج الويب هوك المباشر من تليجرام
+async function handleTelegramWebhook(request, env) {
+  const receivedAt = isoNow();
+  let update;
+  try {
+    update = await request.json();
+  } catch (_) {
+    return textResponse("Invalid JSON", 400);
+  }
+
+  // معالجة الرسائل العادية
+  if (update.message) {
+    const msg = update.message;
+    const chatId = String(msg.chat.id);
+    const text = msg.text || msg.caption || "";
+    const senderName = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || msg.from?.username || "مستخدم تليجرام";
+
+    // تحويل رسالة تليجرام لهيكل الحدث الموحد
+    const normalizedPayload = {
+      id: `tg_${update.update_id}`,
+      event: "message.received",
+      account: {
+        id: "telegram_bot",
+        platform: "telegram"
+      },
+      message: {
+        id: `tg_msg_${msg.message_id}`,
+        conversationId: chatId,
+        text,
+        sender: {
+          id: String(msg.from?.id || chatId),
+          name: senderName
+        },
+        attachments: msg.voice ? [{ type: "audio", file_id: msg.voice.file_id }] : []
       }
+    };
 
-      // أ) ويب هوك Zernio (Meta & TikTok)
-      if (request.method === "POST" && url.pathname === "/webhook/zernio") {
-        const receivedAt = isoNow();
-        const rawBody = await request.text();
-        const signature = request.headers.get("X-Zernio-Signature");
-
-        if (signature && env.ZERNIO_WEBHOOK_SECRET) {
-          const computed = await hmacSha256Hex(env.ZERNIO_WEBHOOK_SECRET, rawBody);
-          if (!safeEqualHex(computed, signature)) return textResponse("Invalid signature", 400);
-        }
-
-        let payload;
-        try { payload = JSON.parse(rawBody); } catch (_) { return textResponse("Invalid JSON", 400); }
-
-        if (env.EVENTS_QUEUE) await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
-        return jsonResponse({ ok: true, queued: true });
-      }
-
-      // ب) ويب هوك Telegram المباشر (تليجرام فقط)
-      if (request.method === "POST" && url.pathname === "/webhook/telegram") {
-        const receivedAt = isoNow();
-        const rawBody = await request.text();
-        let update;
-        try { update = JSON.parse(rawBody); } catch (_) { return textResponse("Invalid JSON", 400); }
-
-        const msg = update.message || update.edited_message;
-        if (msg && msg.chat) {
-          // تحويل حدث تليجرام لنفس الصيغة الموحدة message.received
-          const payload = {
-            id: `tg_${msg.message_id}`,
-            event: "message.received",
-            account: { id: "telegram_bot", platform: "telegram" },
-            message: {
-              id: String(msg.message_id),
-              conversationId: String(msg.chat.id),
-              text: msg.text || msg.caption || "",
-              sender: { id: String(msg.from?.id), name: msg.from?.first_name || msg.from?.username || "Telegram User" }
-            }
-          };
-
-          if (env.EVENTS_QUEUE) await env.EVENTS_QUEUE.send({ rawBody: JSON.stringify(payload), payload, receivedAt });
-        }
-        return jsonResponse({ ok: true, queued: true });
-      }
-
-      // ج) ويب هوك Gmail المباشر (من Google Apps Script)
-      if (request.method === "POST" && url.pathname === "/webhook/gmail") {
-        const receivedAt = isoNow();
-        const rawBody = await request.text();
-        let data;
-        try { data = JSON.parse(rawBody); } catch (_) { return textResponse("Invalid JSON", 400); }
-
-        // تحويل إيميل جيميل لنفس الصيغة الموحدة message.received
-        const payload = {
-          id: `gmail_${data.messageId || shortId()}`,
-          event: "message.received",
-          account: { id: "gmail_inbox", platform: "gmail" },
-          message: {
-            id: data.messageId || shortId(),
-            conversationId: data.threadId || data.fromEmail,
-            text: `[موضوع الإيميل: ${data.subject || 'بدون عنوان'}]\n\n${data.body || ''}`,
-            sender: { id: data.fromEmail, name: data.fromName || data.fromEmail },
-            metadata: {
-              subject: data.subject,
-              fromEmail: data.fromEmail,
-              threadId: data.threadId,
-              appsScriptCallbackUrl: data.appsScriptCallbackUrl
-            }
-          }
-        };
-
-        if (env.EVENTS_QUEUE) await env.EVENTS_QUEUE.send({ rawBody: JSON.stringify(payload), payload, receivedAt });
-        return jsonResponse({ ok: true, queued: true });
-      }
-
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-        return await handleHealth(request, env);
-      }
-
-      if (request.method === "GET" && url.pathname === "/health/review") {
-        return await handleReviewQueue(request, env);
-      }
-
-      if (request.method === "GET" && url.pathname === "/dashboard") {
-        return await handleDashboard(request, env);
-      }
-
-      return textResponse("Not found", 404);
-    } catch (err) {
-      return jsonResponse({ ok: false, error: err.message }, 500);
+    if (env.EVENTS_QUEUE) {
+      await env.EVENTS_QUEUE.send({
+        rawBody: JSON.stringify(normalizedPayload),
+        payload: normalizedPayload,
+        receivedAt
+      });
     }
-  },
+  }
 
-  // مستهلك الطوابير
-  async queue(batch, env) {
-    if (batch.queue && batch.queue.endsWith("-dlq")) {
-      for (const message of batch.messages) {
-        const { rawBody, payload, receivedAt } = message.body || {};
-        try {
-          await handleUnifiedEvent(env, rawBody, payload, receivedAt);
-          message.ack();
-        } catch (dlqErr) {
-          if (payload?.id) {
-            await kvSetJSON(env, `review:${payload.id}`, {
-              eventId: payload.id,
-              event: payload.event || "unknown",
-              outcome: "dlq-final-review",
-              error: dlqErr.message,
-              ts: isoNow()
-            }, LOG_TTL_SECONDS);
-          }
-          message.ack();
-        }
-      }
-      return;
-    }
-
-    for (const message of batch.messages) {
-      const { rawBody, payload, receivedAt } = message.body || {};
-      try {
-        await handleUnifiedEvent(env, rawBody, payload, receivedAt);
-        message.ack();
-      } catch (err) {
-        const attempt = message.attempts || 1;
-        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800);
-        message.retry({ delaySeconds });
-      }
-    }
-  },
-};
-
-// -----------------------------------------------------------------------------
-// 10) لوحة المتابعة المسطحة والـ Health
-// -----------------------------------------------------------------------------
+  return jsonResponse({ ok: true, status: "telegram_received" });
+}
 
 async function handleHealth(request, env) {
   const url = new URL(request.url);
@@ -1259,6 +1308,7 @@ async function handleHealth(request, env) {
     ZERNIO_API_KEY: !!apiKey,
     ZERNIO_WEBHOOK_SECRET: !!env.ZERNIO_WEBHOOK_SECRET,
     AI_ROUTER_API_KEY: !!(env.AI_ROUTER_API_KEY || env.GEMINI_API_KEY),
+    TELEGRAM_BOT_TOKEN: !!(await getTelegramBotToken(env)),
   };
 
   let zernioRest = { connected: false };
@@ -1269,8 +1319,13 @@ async function handleHealth(request, env) {
     if (res.ok) {
       const data = await res.json();
       zernioRest = { connected: true, accountCount: ((data && data.accounts) || (Array.isArray(data) ? data : [])).length };
+    } else {
+      const errText = await res.text().catch(() => "");
+      zernioRest = { connected: false, status: res.status, error: errText.slice(0, 300) };
     }
-  } catch (err) {}
+  } catch (err) {
+    zernioRest = { connected: false, error: err.message };
+  }
 
   const eventId = url.searchParams.get("eventId");
   const since = computeSinceDate(url);
@@ -1300,6 +1355,10 @@ async function handleReviewQueue(request, env) {
     return jsonResponse({ ok: false, error: err.message }, 500);
   }
 }
+
+// -----------------------------------------------------------------------------
+// 10) تصميم صفحة الـ /dashboard المعتمدة (#f5f5f5 + اللوجو في المنتصف بالأعلى)
+// -----------------------------------------------------------------------------
 
 async function handleDashboard(request, env) {
   const url = new URL(request.url);
@@ -1391,7 +1450,7 @@ async function handleDashboard(request, env) {
       document.getElementById('stats-pills').innerHTML =
         '<span class="pill ' + (zc ? 'pill-ok' : 'pill-err') + '">Zernio: ' + (zc ? '🟢 متصل' : '🔴 غير متصل') + '</span>' +
         '<span class="pill">الحسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</span>' +
-        '<span class="pill">طابور المعالجة: نشط</span>' +
+        '<span class="pill">طابور Queues: نشط</span>' +
         '<span class="pill">مدة السجل: 7 أيام</span>';
 
       const logsEl = document.getElementById('logs-container');
@@ -1425,4 +1484,95 @@ async function handleDashboard(request, env) {
 </html>`;
 
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-  }
+}
+
+// -----------------------------------------------------------------------------
+// 11) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
+// -----------------------------------------------------------------------------
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      if (url.pathname.startsWith("/api/")) {
+        return await handleApiRequests(request, env, url);
+      }
+
+      // استقبال ويب هوك Zernio (Meta, TikTok)
+      if (request.method === "POST" && url.pathname === "/webhook/zernio") {
+        return await handleZernioWebhook(request, env);
+      }
+
+      // استقبال ويب هوك Telegram المباشر
+      if (request.method === "POST" && url.pathname === "/webhook/telegram") {
+        return await handleTelegramWebhook(request, env);
+      }
+
+      if (request.method === "GET" && (url.pathname === "/webhook/zernio" || url.pathname === "/webhook/telegram")) {
+        return textResponse("Webhook active and listening.");
+      }
+
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+        return await handleHealth(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/health/review") {
+        return await handleReviewQueue(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/dashboard") {
+        return await handleDashboard(request, env);
+      }
+
+      return textResponse("Not found", 404);
+    } catch (err) {
+      console.error("Unhandled fetch error", err);
+      await logActivity(env, { event: "webhook", outcome: "fatal-error", error: err.message, timing: { receivedAt: isoNow() } }).catch(() => {});
+      return jsonResponse({ ok: false, error: err.message }, 500);
+    }
+  },
+
+  // مستهلك الطوابير الموحد لجميع المنصات
+  async queue(batch, env) {
+    if (batch.queue && batch.queue.endsWith("-dlq")) {
+      for (const message of batch.messages) {
+        const { rawBody, payload, receivedAt } = message.body || {};
+        try {
+          await handleZernioEvent(env, rawBody, payload, receivedAt);
+          message.ack();
+        } catch (dlqErr) {
+          console.error("DLQ Emergency event:", payload?.id, dlqErr.message);
+          if (payload?.id) {
+            await kvSetJSON(env, `review:${payload.id}`, {
+              eventId: payload.id,
+              event: payload.event || "unknown",
+              outcome: "dlq-final-review",
+              error: dlqErr.message,
+              ts: isoNow()
+            }, LOG_TTL_SECONDS);
+          }
+          message.ack();
+        }
+      }
+      return;
+    }
+
+    for (const message of batch.messages) {
+      const { rawBody, payload, receivedAt } = message.body || {};
+      try {
+        await handleZernioEvent(env, rawBody, payload, receivedAt);
+        message.ack();
+      } catch (err) {
+        console.error("queue retry", payload && payload.id, err && err.message);
+        const attempt = message.attempts || 1;
+        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800);
+        message.retry({ delaySeconds });
+      }
+    }
+  },
+};
