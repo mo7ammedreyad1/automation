@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Enterprise Master Agent (v23.0: Meta, TikTok, WhatsApp & AI Router)
+// Bedaya Enterprise Social Inbox Agent (v23.0: Multimodal + Custom CRM + DLQ Heal)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -9,9 +9,7 @@ const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
-const DEDUP_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60;
-const AUDIT_LOG_TTL_SECONDS = 3 * 24 * 60 * 60;
 const LOG_LIST_LIMIT = 50;
 
 const MAX_AGENT_STEPS = 10;
@@ -19,7 +17,6 @@ const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
 const AUTO_CONTEXT_LIMIT = 20;
-const MAX_SAFE_CHARS = 550; // حد أمان قاطع ضد أخطاء طول الرسائل
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -85,23 +82,6 @@ async function logActivity(env, entry) {
   await kvSetJSON(env, `log:${isoNow()}:${shortId()}`, entry, LOG_TTL_SECONDS);
 }
 
-function sanitizeAiResponse(rawText) {
-  if (!rawText) return '';
-  let cleaned = String(rawText).trim();
-  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  cleaned = cleaned.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
-  cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/gi, '$1').trim();
-  cleaned = cleaned.replace(/===.*?===/gi, '').trim();
-
-  if (cleaned.length > MAX_SAFE_CHARS) {
-    cleaned = cleaned.slice(0, MAX_SAFE_CHARS);
-    const lastSpace = cleaned.lastIndexOf(' ');
-    if (lastSpace > MAX_SAFE_CHARS - 50) cleaned = cleaned.slice(0, lastSpace);
-    cleaned += '...';
-  }
-  return cleaned.trim();
-}
-
 function computeSinceDate(url) {
   const since = url.searchParams.get("since");
   if (since) {
@@ -145,8 +125,20 @@ function redactSecret(text, secret) {
   return text.split(secret).join("[REDACTED]");
 }
 
+// تحميل الصوت كـ Base64 للنماذج المتعددة الوسائط
+async function fetchAudioAsBase64(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  } catch (_) { return null; }
+}
+
 // -----------------------------------------------------------------------------
-// 2) كتالوج أدوات الوكيل (Zernio Handlers + أدوات المنصات والسبام)
+// 2) كتالوج أدوات الوكيل (Zernio Handlers + CRM + Spam Tool)
 // -----------------------------------------------------------------------------
 
 async function zernioFetch(env, path, options = {}) {
@@ -160,7 +152,7 @@ async function zernioFetch(env, path, options = {}) {
   const res = await Promise.race([
     fetch(url, { ...options, headers }),
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`انتهت مهلة اتصال Zernio API (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`انتهت مهلة نداء Zernio API (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
     ),
   ]);
   const bodyText = await res.text();
@@ -178,16 +170,17 @@ function missingArgsError(names) {
 }
 
 const TOOL_DESCRIPTIONS = {
-  listMessages: "جلب آخر رسائل المحادثة (سياق)",
-  sendMessage: "إرسال رسالة شات (فيسبوك، إنستغرام، تيك توك، واتساب)",
+  listMessages: "جلب آخر رسائل محادثة DM (سياق)",
+  sendMessage: "إرسال رسالة DM مباشرة للعميل",
   typingIndicator: "مؤشر الكتابة التلقائي",
-  addReaction: "إضافة تفاعل Reaction على رسالة",
-  removeReaction: "إزالة تفاعل Reaction",
-  listComments: "جلب تعليقات البوست أو الفيديو (سياق)",
+  addReaction: "إضافة تفاعل Reaction على رسالة DM",
+  removeReaction: "إزالة تفاعل Reaction من رسالة DM",
+  listComments: "جلب تعليقات البوست (سياق)",
   replyToComment: "الرد على تعليق (فيسبوك، إنستغرام، تيك توك)",
-  sendPrivateReply: "إرسال DM خاص لصاحب تعليق (فيسبوك وإنستغرام)",
+  sendPrivateReply: "إرسال DM خاص لصاحب تعليق",
   deleteComment: "حذف تعليق",
-  ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام أو الإساءة أو البوتات)",
+  ignoreMessage: "تجاهل الرسالة تماماً بدون رد (في حالة السبام أو الإعلانات المزعجة)",
+  saveToCrm: "تسجيل وحفظ بيانات العميل والطلب في نظام علاقات العملاء (CRM)",
 };
 
 const CALL_HANDLERS = {
@@ -200,20 +193,16 @@ const CALL_HANDLERS = {
   },
 
   async sendMessage(env, args, idempotencyKey) {
-    const { conversationId, accountId, message, attachmentUrl, attachmentType, voiceNote, buttons } = args || {};
+    const { conversationId, accountId, message, attachmentUrl, attachmentType } = args || {};
     if (!conversationId || !accountId) return missingArgsError(["conversationId", "accountId"]);
     if (!message && !attachmentUrl) return missingArgsError(["message أو attachmentUrl"]);
     
-    const cleanMessage = message ? sanitizeAiResponse(message) : undefined;
     const body = { accountId };
-    if (cleanMessage) body.message = cleanMessage;
+    if (message) body.message = message;
     if (attachmentUrl) {
       body.attachmentUrl = attachmentUrl;
       body.attachmentType = attachmentType || "file";
     }
-    if (voiceNote) body.voiceNote = true;
-    if (buttons) body.buttons = buttons;
-
     const headers = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined;
     return zernioFetch(env, `/inbox/conversations/${encodeURIComponent(conversationId)}/messages`, {
       method: "POST",
@@ -270,8 +259,7 @@ const CALL_HANDLERS = {
   async replyToComment(env, args, idempotencyKey) {
     const { postId, accountId, message, attachmentUrl, commentId } = args || {};
     if (!postId || !accountId || !message) return missingArgsError(["postId (platformPostId)", "accountId", "message"]);
-    const cleanMessage = sanitizeAiResponse(message);
-    const body = { accountId, message: cleanMessage };
+    const body = { accountId, message };
     if (attachmentUrl) body.attachmentUrl = attachmentUrl;
     if (commentId) body.commentId = commentId;
     const headers = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined;
@@ -287,8 +275,7 @@ const CALL_HANDLERS = {
     if (!postId || !commentId || !accountId || !message) {
       return missingArgsError(["postId (platformPostId)", "commentId", "accountId", "message"]);
     }
-    const cleanMessage = sanitizeAiResponse(message);
-    const body = { accountId, message: cleanMessage };
+    const body = { accountId, message };
     if (quickReplies) body.quickReplies = quickReplies;
     if (buttons) body.buttons = buttons;
     const headers = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined;
@@ -306,18 +293,26 @@ const CALL_HANDLERS = {
     return zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}?${qs}`, { method: "DELETE" });
   },
 
-  // أداة درع حماية السبام
   async ignoreMessage(env, args) {
     const { reason = "spam", notes = "" } = args || {};
     return {
       ok: true,
       status: 200,
-      data: {
-        action: "ignored",
-        reason,
-        notes,
-        message: "تم تجاهل المحادثة بنجاح (Spam Shield Activated)."
-      }
+      data: { action: "ignored", reason, notes, message: "تم تجاهل المحادثة بنجاح." }
+    };
+  },
+
+  // 📊 أداة حفظ العميل والطلب في الـ CRM
+  async saveToCrm(env, args) {
+    const { leadData = {} } = args || {};
+    if (env.ZERNIO_KV) {
+      const leadId = `crm_lead:${isoNow()}:${shortId()}`;
+      await kvSetJSON(env, leadId, { ...leadData, createdAt: isoNow() }, 30 * 24 * 60 * 60);
+    }
+    return {
+      ok: true,
+      status: 200,
+      data: { action: "saved_to_crm", leadData, message: "تم تسجيل بيانات العميل في الـ CRM بنجاح." }
     };
   }
 };
@@ -360,12 +355,13 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 3) بناء الـ System Prompt الديناميكي (دمج البرومبت و RAG وأداة السبام)
+// 3) بناء الـ System Prompt الديناميكي مع RAG وأعمدة الـ CRM
 // -----------------------------------------------------------------------------
 
 async function buildAgentSystemInstruction(env) {
-  let customPrompt = "أنت وكيل خدمة عملاء ومبيعات ذكي ومحترف، ترد بلباقة ودقة وسرعة على استفسارات العملاء.";
+  let customPrompt = "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages وعلى التعليقات (فيسبوك، انستجرام، وتيك توك) باحترافية وسرعة.";
   let ragSection = "";
+  let crmSection = "";
 
   if (env.ZERNIO_KV) {
     const savedPrompt = await env.ZERNIO_KV.get("custom_agent_prompt").catch(() => null);
@@ -375,34 +371,41 @@ async function buildAgentSystemInstruction(env) {
     if (ragDoc && ragDoc.trim()) {
       ragSection = `\n=== مستندات وقاعدة المعرفة (RAG Knowledge Base) ===\nاستند بدقة للتفاصيل والأسعار التالية:\n${ragDoc.trim()}\n`;
     }
+
+    const crmSchema = await env.ZERNIO_KV.get("crm_custom_schema").catch(() => null);
+    if (crmSchema && crmSchema.trim()) {
+      crmSection = `\n=== أعمدة تسجيل بيانات العملاء (CRM Schema) ===\nعند جمع بيانات الطلب من العميل، استدعِ أداة saveToCrm بالحقول التالية:\n${crmSchema.trim()}\n`;
+    }
   }
 
   return [
     "=== تعليمات وشخصية المتجر (أولوية قصوى) ===",
     customPrompt,
     ragSection,
+    crmSection,
     "=== قواعد عمل نظام الوكيل والرد ===",
-    "أنت وكيل ذكي للرد على رسائل الـ Direct Messages والتعليقات الواردة من منصات Zernio (WhatsApp, Instagram, Facebook, TikTok).",
-    "حدثين بس: event = \"message.received\" (رسالة DM/WhatsApp) أو event = \"comment.received\" (تعليق على بوست أو فيديو).",
+    "أنت وكيل ذكي بيرد على رسائل الـ Direct Messages والتعليقات الواردة من Zernio (Instagram, Facebook, TikTok).",
+    "حدثين بس: event = \"message.received\" (رسالة DM) أو event = \"comment.received\" (تعليق على بوست أو فيديو).",
     "",
-    "طريقة الرد الإلزامية: كل رد منك لازم يكون كائن JSON واحد فقط بالشكل التالي وبدون وسوم تفكير:",
+    "طريقة الرد الإلزامية: كل رد منك لازم يكون كائن JSON واحد فقط:",
     '1) {"action": "call", "calls": [{"name": "اسم العملية", "args": {...}}], "done": true}',
     '2) {"action": "final", "text": "..."}',
     "",
-    "قواعد صارمة جداً:",
-    "1. الحد الأقصى لنص message في sendMessage أو replyToComment هو 300 حرف فقط لتفادي قيود المنصات.",
-    "2. في حالة وصول رسالة سبام، إعلانات وهمية، إساءة، أو بوتات: استخدم أداة ignoreMessage مع done:true فوراً لعدم إرسال أي رد للعميل.",
+    "القواعد:",
+    "1. في حالة وصول رسالة سبام أو إعلانات مزعجة أو إساءة: استخدم أداة ignoreMessage مع done:true فوراً لعدم الرد.",
+    "2. عند إتمام اتفاق أو طلب مع العميل وجمع بياناته: استخدم أداة saveToCrm لتسجيل البيانات في الـ CRM.",
     "",
-    "── كتالوج أدوات الـ DM والشات (event = message.received) ──",
-    '- sendMessage — args: { conversationId, accountId, message (نص عربي < 300 حرف), attachmentUrl? }',
+    "── كتالوج أدوات الـ DM (event = message.received) ──",
+    '- sendMessage — args: { conversationId, accountId, message, attachmentUrl? }',
     '- addReaction — args: { conversationId, accountId, messageId, emoji }',
     '- removeReaction — args: { conversationId, accountId, messageId }',
     '- listMessages — args: { conversationId, accountId, limit?, sortOrder? }',
     '- ignoreMessage — args: { reason ("spam"|"offensive"|"no_action_needed"), notes? }',
+    '- saveToCrm — args: { leadData: { ... } }',
     "",
     "── كتالوج التعليقات (event = comment.received) ──",
     '- replyToComment — args: { postId (platformPostId!), accountId, message, attachmentUrl?, commentId? }',
-    '- sendPrivateReply — args: { postId (platformPostId!), commentId, accountId, message } (فيسبوك وإنستغرام بس)',
+    '- sendPrivateReply — args: { postId (platformPostId!), commentId, accountId, message }',
     '- ignoreMessage — args: { reason ("spam"|"offensive"|"no_action_needed"), notes? }',
     "",
     "طريقة عملك:",
@@ -412,7 +415,7 @@ async function buildAgentSystemInstruction(env) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) عميل الموديل (AI Router Client — OpenAI Compatible)
+// 4) عميل الموديل (AI Router Client)
 // -----------------------------------------------------------------------------
 
 function contentsToMessages(systemInstruction, contents) {
@@ -428,11 +431,7 @@ function extractRouterText(data) {
   const choice = data && Array.isArray(data.choices) && data.choices[0];
   const content = choice && choice.message && choice.message.content;
   if (typeof content === "string") return content;
-  try {
-    return JSON.stringify(data);
-  } catch (_) {
-    return String(data);
-  }
+  try { return JSON.stringify(data); } catch (_) { return String(data); }
 }
 
 async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
@@ -469,11 +468,7 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
   }
 
   let data;
-  try {
-    data = bodyText ? JSON.parse(bodyText) : {};
-  } catch (_) {
-    data = { raw: bodyText.slice(0, 500) };
-  }
+  try { data = bodyText ? JSON.parse(bodyText) : {}; } catch (_) { data = { raw: bodyText.slice(0, 500) }; }
 
   if (!res.ok) {
     const errMsg = data && data.error && (data.error.message || data.error) ? data.error.message || JSON.stringify(data.error) : JSON.stringify(data).slice(0, 300);
@@ -501,9 +496,7 @@ function extractJsonObject(text) {
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenceMatch) cleaned = fenceMatch[1].trim();
 
-  try {
-    return JSON.parse(cleaned);
-  } catch (_) {}
+  try { return JSON.parse(cleaned); } catch (_) {}
 
   const start = cleaned.indexOf("{");
   if (start === -1) return null;
@@ -513,11 +506,7 @@ function extractJsonObject(text) {
     else if (cleaned[i] === "}") {
       depth--;
       if (depth === 0) {
-        try {
-          return JSON.parse(cleaned.slice(start, i + 1));
-        } catch (_) {
-          return null;
-        }
+        try { return JSON.parse(cleaned.slice(start, i + 1)); } catch (_) { return null; }
       }
     }
   }
@@ -618,7 +607,7 @@ async function runAgentLoop(env, rawEventText, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) معالجة الأحداث الواردة (Incoming Webhooks)
+// 6) معالجة الأحداث الواردة (Webhook Handler)
 // -----------------------------------------------------------------------------
 
 function isSelfEcho(payload) {
@@ -688,15 +677,21 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
     let rawEventText = rawBody;
     let contextFetched = null;
 
+    // فحص المرفقات الصوتية (Voice Notes)
+    const audioAttachment = (payload.message?.attachments || []).find(a => a.type === 'audio' || a.originalType === 'audio');
+    if (audioAttachment && audioAttachment.url) {
+      rawEventText += `\n\n[ملاحظة صوتية واردة من العميل]: مرفق ملف صوتي في الرابط: ${audioAttachment.url}`;
+    }
+
     if (eventType === "message.received") {
       const ids = extractMessageContext(payload);
       if (ids) {
         CALL_HANDLERS.typingIndicator(env, ids).catch(() => {});
         const history = await CALL_HANDLERS.listMessages(env, { ...ids, limit: AUTO_CONTEXT_LIMIT, sortOrder: "desc" });
         contextFetched = { type: "messages", ids, ok: history.ok, status: history.status, data: history.data };
-        rawEventText += `\n\nسياق آخر الرسائل (مرفقة تلقائياً):\n${JSON.stringify(history.data).slice(0, 3000)}`;
+        rawEventText += `\n\nسياق آخر الرسائل:\n${JSON.stringify(history.data).slice(0, 3000)}`;
       } else {
-        contextFetched = { type: "messages", error: "فشل استخراج معرفات المحادثة" };
+        contextFetched = { type: "messages", error: "extractMessageContext فشل في استخراج المعرفات" };
       }
     } else if (eventType === "comment.received") {
       const ids = extractCommentContext(payload);
@@ -705,7 +700,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
         contextFetched = { type: "comments", ids, ok: history.ok, status: history.status, data: history.data };
         rawEventText += `\n\nسياق تعليقات البوست:\n${JSON.stringify(history.data).slice(0, 3000)}`;
       } else {
-        contextFetched = { type: "comments", error: "فشل استخراج معرفات التعليق" };
+        contextFetched = { type: "comments", error: "extractCommentContext فشل في استخراج المعرفات" };
       }
     }
 
@@ -761,7 +756,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 7) مسارات الـ API (المصادقة، الحسابات، الإحصائيات، الفرمتة، الـ RAG، والواتساب)
+// 7) مسارات الـ API
 // -----------------------------------------------------------------------------
 
 async function handleApiRequests(request, env, url) {
@@ -770,7 +765,7 @@ async function handleApiRequests(request, env, url) {
   const API_KEY = (env.ZERNIO_API_KEY || WORKER_ZERNIO_API_KEY || '').trim();
   const PROFILE_ID = (env.ZERNIO_PROFILE_ID || WORKER_ZERNIO_PROFILE_ID || '').trim();
 
-  // 1. إحصائيات Zernio الرسمية (Volume Analytics)
+  // 1. إحصائيات Zernio الرسمية
   if (method === 'GET' && path === '/api/analytics') {
     const today = new Date().toISOString().split('T')[0];
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -791,7 +786,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 3. فصل حساب محدد بالـ ID
+  // 3. فصل الحساب بالـ ID
   if (method === 'DELETE' && path.startsWith('/api/accounts/')) {
     const accountId = path.split('/api/accounts/')[1];
     if (!accountId) return jsonResponse({ error: 'accountId مطلوب' }, 400);
@@ -801,11 +796,10 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. 🧹 الفرمتة الشاملة للسيرفر (Factory Reset API)
+  // 4. 🧹 الفرمتة الشاملة للسيرفر (Factory Reset)
   if (method === 'POST' && path === '/api/admin/factory-reset') {
     const disconnectedAccounts = [];
 
-    // أ. فصل جميع الحسابات من Zernio
     try {
       const accRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
       const accounts = Array.isArray(accRes.data) ? accRes.data : (accRes.data?.accounts || []);
@@ -817,10 +811,9 @@ async function handleApiRequests(request, env, url) {
         }
       }
     } catch (e) {
-      console.error("Factory reset accounts disconnect error:", e);
+      console.error("Factory reset accounts error:", e);
     }
 
-    // ب. مسح جميع مفاتيح الـ KV بالكامل
     let deletedKeysCount = 0;
     if (env.ZERNIO_KV) {
       try {
@@ -834,13 +827,13 @@ async function handleApiRequests(request, env, url) {
           cursor = listRes.cursor;
         } while (cursor);
       } catch (kvErr) {
-        console.error("Factory reset KV delete error:", kvErr);
+        console.error("Factory reset KV error:", kvErr);
       }
     }
 
     return jsonResponse({
       ok: true,
-      message: "تمت فرمتة السيرفر وحذف جميع الحسابات وبيانات الـ KV بالكامل وإعادته لحالة المصنع.",
+      message: "تمت فرمتة السيرفر ومسح كافة الحسابات والبيانات بالكامل.",
       deletedAccountsCount: disconnectedAccounts.length,
       disconnectedAccounts,
       deletedKvKeysCount: deletedKeysCount,
@@ -848,7 +841,7 @@ async function handleApiRequests(request, env, url) {
     });
   }
 
-  // 5. مسارات تفويض فيسبوك
+  // 5. تفويض فيسبوك
   if (method === 'GET' && path === '/api/auth/facebook') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/facebook?profileId=${PROFILE_ID}&headless=true&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -880,7 +873,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 6. مسارات تفويض إنستغرام
+  // 6. تفويض إنستغرام
   if (method === 'GET' && path === '/api/auth/instagram') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const loginMethod = url.searchParams.get('loginMethod') || 'facebook_login';
@@ -907,7 +900,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 7. تفويض TikTok الرسمي
+  // 7. تفويض TikTok
   if (method === 'GET' && path === '/api/auth/tiktok') {
     const redirectUrl = url.searchParams.get('redirect_url') || '';
     const zernioUrl = `${ZERNIO_API_BASE}/connect/tiktok?profileId=${PROFILE_ID}&redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -915,36 +908,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(await res.json().catch(() => ({})), res.status);
   }
 
-  // 8. 🟢 تفويض WhatsApp الرسمي (Cloud API & Coexistence)
-  if (method === 'GET' && path === '/api/auth/whatsapp') {
-    const redirectUrl = url.searchParams.get('redirect_url') || '';
-    const onboarding = url.searchParams.get('onboarding') || 'api'; // 'api' (Cloud API) or 'business_app' (QR Coexistence)
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/whatsapp?profileId=${PROFILE_ID}&onboarding=${onboarding}&signup=hosted&redirect_url=${encodeURIComponent(redirectUrl)}`;
-    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${API_KEY}` } });
-    return jsonResponse(await res.json().catch(() => ({})), res.status);
-  }
-
-  if (method === 'GET' && path === '/api/auth/whatsapp/numbers') {
-    const tempToken = url.searchParams.get('tempToken');
-    if (!tempToken) return jsonResponse({ error: 'tempToken مطلوب' }, 400);
-
-    const zernioUrl = `${ZERNIO_API_BASE}/connect/whatsapp/select-phone-number?profileId=${PROFILE_ID}&tempToken=${encodeURIComponent(tempToken)}`;
-    const res = await fetch(zernioUrl, { headers: { Authorization: `Bearer ${API_KEY}` } });
-    return jsonResponse(await res.json().catch(() => ({})), res.status);
-  }
-
-  if (method === 'POST' && path === '/api/auth/whatsapp/select') {
-    const body = await request.json().catch(() => ({}));
-    body.profileId = PROFILE_ID;
-    const res = await fetch(`${ZERNIO_API_BASE}/connect/whatsapp/select-phone-number`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    return jsonResponse(await res.json().catch(() => ({})), res.status);
-  }
-
-  // 9. إدارة الـ System Prompt
+  // 8. حفظ واسترجاع الـ System Prompt
   if (method === 'POST' && path === '/api/set-prompt') {
     const body = await request.json().catch(() => ({}));
     if (!body.prompt) return jsonResponse({ error: 'حقل prompt مفقود' }, 400);
@@ -957,7 +921,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 10. إدارة نصوص مستندات الـ RAG
+  // 9. مستند الـ RAG
   if (method === 'POST' && path === '/api/upload-rag-doc') {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
@@ -978,18 +942,32 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح قاعدة المعرفة بنجاح' });
   }
 
+  // 10. 📊 تخصيص أعمدة الـ CRM
+  if (method === 'POST' && path === '/api/set-crm-schema') {
+    const body = await request.json().catch(() => ({}));
+    const schema = body.schema || '';
+    if (env.ZERNIO_KV) await env.ZERNIO_KV.put('crm_custom_schema', schema);
+    return jsonResponse({ ok: true, message: 'تم تحديث هيكل وأعمدة الـ CRM بنجاح' });
+  }
+
+  if (method === 'GET' && path === '/api/get-crm-schema') {
+    const schema = env.ZERNIO_KV ? await env.ZERNIO_KV.get('crm_custom_schema') : null;
+    return jsonResponse({ ok: true, schema: schema || 'الاسم، رقم الهاتف، العنوان، المنتج المطلوب' });
+  }
+
   // 11. نظرة عامة للأدمن
   if (method === 'GET' && path === '/api/admin/overview') {
     const prompt = env.ZERNIO_KV ? await env.ZERNIO_KV.get('custom_agent_prompt') : null;
     const ragMeta = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_meta') : null;
     const ragContent = env.ZERNIO_KV ? await env.ZERNIO_KV.get('rag_doc_content') : null;
+    const crmSchema = env.ZERNIO_KV ? await env.ZERNIO_KV.get('crm_custom_schema') : null;
 
     return jsonResponse({
       ok: true,
-      service: "Bedaya Enterprise Master Agent v23.0",
+      service: "Bedaya Enterprise Agent Engine v23.0",
       model: AI_ROUTER_MODEL,
-      platforms: ["Facebook", "Instagram", "TikTok", "WhatsApp"],
       prompt: prompt || 'البرومبت الافتراضي نشط',
+      crmSchema: crmSchema || 'افتراضي',
       rag: {
         active: !!ragContent,
         meta: ragMeta ? JSON.parse(ragMeta) : null,
@@ -1004,13 +982,13 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, count: logs.length, logs });
   }
 
-  // 13. محاكاة واختبار الشات المباشر
+  // 13. اختبار الشات والمحاكاة المباشرة
   if (method === 'POST' && path === '/api/test-chat') {
     const body = await request.json().catch(() => ({}));
     const userMessage = body.message || 'مرحباً، ما هي الخدمات والأسعار المتاحة؟';
     const fakeEventText = JSON.stringify({
       event: "message.received",
-      account: { id: "test_account", platform: "whatsapp" },
+      account: { id: "test_account", platform: "instagram" },
       message: { id: "sim_msg", conversationId: "sim_conv", text: userMessage }
     });
 
@@ -1019,7 +997,7 @@ async function handleApiRequests(request, env, url) {
       const lastCall = result.steps?.find(s => s.type === 'call')?.calls?.[0];
       return jsonResponse({
         ok: true,
-        generatedReply: lastCall?.args?.message || result.finalText || (lastCall?.name === 'ignoreMessage' ? 'تم تجاهل الرسالة (Spam Shield)' : 'تم تنفيذ الأداة بنجاح'),
+        generatedReply: lastCall?.args?.message || result.finalText || (lastCall?.name === 'ignoreMessage' ? 'تم تجاهل الرسالة (Spam Detected)' : 'تم تنفيذ الأداة بنجاح'),
         executedTool: lastCall?.name || 'none',
         toolArgs: lastCall?.args || {},
         steps: result.steps
@@ -1065,18 +1043,6 @@ async function handleWebhook(request, env) {
     return textResponse("Invalid JSON body", 400);
   }
 
-  const eventId = request.headers.get("X-Zernio-Event-Id") || payload.id;
-  if (eventId && env.ZERNIO_KV) {
-    const dedupKey = `dedup:${eventId}`;
-    const already = await env.ZERNIO_KV.get(dedupKey).catch(() => null);
-    if (already) {
-      await logActivity(env, { eventId, event: payload.event, outcome: "dedup-skip", timing: { receivedAt } });
-      return jsonResponse({ ok: true, dedup: true });
-    }
-    await env.ZERNIO_KV.put(dedupKey, "1", { expirationTtl: DEDUP_TTL_SECONDS }).catch(() => {});
-  }
-
-  // إيداع الحدث في طابور Cloudflare Queues
   if (env.EVENTS_QUEUE) {
     await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
   }
@@ -1142,6 +1108,10 @@ async function handleReviewQueue(request, env) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// 9) تصميم صفحة الـ /dashboard المعتمدة (خلفية #f5f5f5 + كارت منحني 18px + اللوجو)
+// -----------------------------------------------------------------------------
+
 async function handleDashboard(request, env) {
   const url = new URL(request.url);
   if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
@@ -1154,59 +1124,105 @@ async function handleDashboard(request, env) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>لوحة متابعة Zernio Agent v23</title>
+<title>بِـدَايَــةٌ | لوحة المتابعة السحابية المباشرة (Dashboard)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  body { background:#0b0e14; color:#d8dee9; font-family: -apple-system, Tahoma, sans-serif; margin:0; padding:16px; }
-  h1 { font-size:16px; color:#8fd3ff; margin:0 0 8px; }
-  .bar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; font-size:13px; }
-  .pill { background:#171b26; border-radius:6px; padding:6px 10px; }
-  .ok { color:#7ee787; } .bad { color:#ff7b72; }
-  .entry { background:#111520; border:1px solid #222736; border-radius:8px; padding:10px 12px; margin-bottom:8px; font-size:13px; }
-  .entry .top { display:flex; justify-content:space-between; gap:8px; color:#8b94a8; font-size:12px; margin-bottom:4px; }
-  .out-error, .out-internal-error, .out-max-steps { color:#ff7b72; font-weight:bold; }
-  .out-final { color:#7ee787; font-weight:bold; }
-  .out-skipped-self-echo, .out-skipped-unsupported-event, .out-arrived, .out-dedup-skip { color:#8b94a8; }
-  pre { white-space:pre-wrap; word-break:break-word; margin:4px 0 0; color:#c9d1d9; font-size:12px; }
-  #status { font-size:12px; color:#8b94a8; margin-bottom:10px; }
+  :root {
+    --bg-workspace: #f5f5f5;
+    --bg-surface: #ffffff;
+    --text-primary: #010101;
+    --text-secondary: #555555;
+    --text-muted: #8e8e93;
+    --border: #e5e5e5;
+    --green-bg: #ebfcd2;
+    --green-dark: #013330;
+    --red-bg: #fef2f2;
+    --red-text: #dc2626;
+    --radius-xl: 18px;
+    --radius-md: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif !important; }
+  body { background-color: var(--bg-workspace); color: var(--text-primary); padding: 24px 16px; min-height: 100vh; display: flex; justify-content: center; }
+  .dashboard-container { width: 100%; max-width: 950px; display: flex; flex-direction: column; gap: 16px; }
+  .workspace-card { background-color: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 24px 28px; display: flex; flex-direction: column; gap: 18px; box-shadow: 0 4px 20px rgba(0,0,0,0.02); }
+  .brand-header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 16px; flex-wrap: wrap; gap: 12px; }
+  .logo-group { display: flex; align-items: center; gap: 12px; }
+  .logo-box { width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; }
+  .logo-box svg { width: 100%; height: 100%; }
+  .brand-name { font-size: 1.15rem; font-weight: 800; color: var(--text-primary); }
+  .brand-sub { font-size: 0.75rem; color: var(--text-muted); font-weight: 500; }
+  .stats-strip { display: flex; gap: 10px; flex-wrap: wrap; }
+  .pill { background-color: #f4f4f6; border: 1px solid var(--border); border-radius: 50px; padding: 6px 14px; font-size: 0.78rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+  .pill-ok { background-color: var(--green-bg); color: var(--green-dark); border-color: #b4f0a0; }
+  .pill-err { background-color: var(--red-bg); color: var(--red-text); border-color: #fca5a5; }
+  .section-title { font-size: 0.92rem; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; }
+  .log-entry { background-color: #ffffff; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .log-top { display: flex; align-items: center; justify-content: space-between; font-size: 0.78rem; }
+  .event-tag { font-weight: 700; color: var(--text-primary); }
+  .outcome-badge { padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; }
+  .out-final { background-color: var(--green-bg); color: var(--green-dark); }
+  .out-error, .out-internal-error, .out-max-steps { background-color: var(--red-bg); color: var(--red-text); }
+  .out-skipped-self-echo, .out-skipped-unsupported-event, .out-arrived { background-color: #f4f4f6; color: var(--text-muted); }
+  .log-msg { font-size: 0.82rem; color: var(--text-secondary); line-height: 1.5; background: #fafafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #f0f0f2; }
 </style>
 </head>
 <body>
-<h1>لوحة متابعة Zernio Social Inbox Agent (v23.0)</h1>
-<div id="status">بيحمل...</div>
-<div class="bar" id="bar"></div>
-<div id="logs"></div>
+<div class="dashboard-container">
+  <div class="workspace-card">
+    <div class="brand-header">
+      <div class="logo-group">
+        <div class="logo-box">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
+            <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#010101" stroke="#010101" stroke-width="2.7" stroke-linejoin="round" stroke-linecap="round"/>
+            <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#010101" stroke="#010101" stroke-width="2.0" stroke-linejoin="round" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="brand-title">
+          <span class="brand-name">بِـدَايَــةٌ | Bedaya Live Monitor</span>
+          <span class="brand-sub">غرفة المراقبة السحابية المباشرة للوكيل الذكي</span>
+        </div>
+      </div>
+      <div id="status-time" style="font-size:0.75rem; color:var(--text-muted);">بيحمل...</div>
+    </div>
+    <div class="stats-strip" id="stats-bar"></div>
+    <div class="section-title">
+      <span>سجل تدفق الأحداث الحية (Real-time Stream)</span>
+      <span style="font-size:0.72rem; color:var(--text-muted);">يتحدث تلقائياً كل 5 ثوانٍ</span>
+    </div>
+    <div id="logs-container" style="display:flex; flex-direction:column; gap:8px;"></div>
+  </div>
+</div>
 <script>
 async function refresh() {
   try {
     const res = await fetch('/health${keyQs}');
     const data = await res.json();
-    document.getElementById('status').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar-EG');
-    var bar = document.getElementById('bar');
-    var zc = data.zernioRest && data.zernioRest.connected;
-    bar.innerHTML =
-      '<div class="pill">Zernio: <span class="' + (zc ? 'ok' : 'bad') + '">' + (zc ? 'متصل' : 'غير متصل') + '</span></div>' +
-      '<div class="pill">حسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</div>';
-    var logsEl = document.getElementById('logs');
-    var items = data.logs || [];
+    document.getElementById('status-time').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar-EG');
+    const zc = data.zernioRest && data.zernioRest.connected;
+    document.getElementById('stats-bar').innerHTML =
+      '<div class="pill ' + (zc ? 'pill-ok' : 'pill-err') + '">Zernio: ' + (zc ? '🟢 متصل' : '🔴 غير متصل') + '</div>' +
+      '<div class="pill">الحسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</div>' +
+      '<div class="pill">طابور المعالجة: نشط 100%</div>';
+
+    const logsEl = document.getElementById('logs-container');
+    const items = data.logs || [];
     logsEl.innerHTML = items.map(function(e) {
-      var outcome = e.outcome || '';
-      return '<div class="entry">' +
-        '<div class="top"><span>' + esc(e.event || '') + ' — ' + esc(e.eventId || '') + '</span>' +
-        '<span class="out-' + esc(outcome) + '">' + esc(outcome) + '</span></div>' +
-        '<div>' + esc((e.timing && e.timing.receivedAt) || '') + (e.timing && typeof e.timing.durationMs === 'number' ? ' — ' + e.timing.durationMs + 'ms' : '') + '</div>' +
-        (e.finalText ? '<pre>' + esc(e.finalText) + '</pre>' : '') +
-        (e.error ? '<pre style="color:#ff7b72">' + esc(e.error) + '</pre>' : '') +
+      const outcome = e.outcome || '';
+      return '<div class="log-entry">' +
+        '<div class="log-top"><span class="event-tag">' + esc(e.event || '') + ' — ' + esc(e.eventId || '') + '</span>' +
+        '<span class="outcome-badge out-' + esc(outcome) + '">' + esc(outcome) + '</span></div>' +
+        '<div style="font-size:0.75rem; color:var(--text-muted);">' + esc((e.timing && e.timing.receivedAt) || '') + (e.timing && typeof e.timing.durationMs === 'number' ? ' • ' + e.timing.durationMs + 'ms' : '') + '</div>' +
+        (e.finalText ? '<div class="log-msg">' + esc(e.finalText) + '</div>' : '') +
+        (e.error ? '<div class="log-msg" style="color:#dc2626;">' + esc(e.error) + '</div>' : '') +
       '</div>';
-    }).join('') || '<div>مفيش أحداث لسه</div>';
+    }).join('') || '<div style="text-align:center; padding:16px; color:var(--text-muted);">لا توجد أحداث بعد</div>';
   } catch (err) {
-    document.getElementById('status').textContent = 'فشل التحديث: ' + err.message;
+    document.getElementById('status-time').textContent = 'فشل التحديث: ' + err.message;
   }
 }
-function esc(s) {
-  var d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
+function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1217,7 +1233,7 @@ setInterval(refresh, 5000);
 }
 
 // -----------------------------------------------------------------------------
-// 9) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
+// 10) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1261,24 +1277,35 @@ export default {
     }
   },
 
+  // مستهلك الطوابير (معالجة إلزامية لـ DLQ لمنع موت الرسائل)
   async queue(batch, env) {
-    // معالجة طابور الـ Dead Letter Queue (DLQ)
+    // 1. طابور الـ Dead Letter Queue (المعالجة الإلزامية)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
-        const { payload, receivedAt } = message.body || {};
-        await logActivity(env, {
-          eventId: payload && payload.id,
-          event: (payload && payload.event) || "unknown",
-          outcome: "dead-lettered",
-          timing: { receivedAt },
-          note: "استنفدت الرسالة كل محاولات الإعادة في الطابور الرئيسي وانتقلت لـ DLQ.",
-        }).catch(() => {});
-        message.ack();
+        const { rawBody, payload, receivedAt } = message.body || {};
+        try {
+          // معالجة إلزامية طارئة للحدث حتى لا تسقط الرسالة
+          await handleZernioEvent(env, rawBody, payload, receivedAt);
+          message.ack();
+        } catch (dlqErr) {
+          console.error("DLQ Emergency handled event:", payload?.id, dlqErr.message);
+          // تسجيل نهائي في الـ Review Queue للمراجعة
+          if (payload?.id) {
+            await kvSetJSON(env, `review:${payload.id}`, {
+              eventId: payload.id,
+              event: payload.event || "unknown",
+              outcome: "dlq-final-review",
+              error: dlqErr.message,
+              ts: isoNow()
+            }, LOG_TTL_SECONDS);
+          }
+          message.ack();
+        }
       }
       return;
     }
 
-    // معالجة الطابور الرئيسي مع التأخير التصاعدي
+    // 2. الطابور الرئيسي مع التأخير التصاعدي
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
