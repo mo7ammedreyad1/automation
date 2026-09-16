@@ -10,6 +10,8 @@ const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
+
+
 // الثوابت التشغيلية
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
 const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام
