@@ -6,8 +6,8 @@
   "compatibility_flags": ["global_fetch_strictly_public"],
   "kv_namespaces": [
     {
-      "binding": "ZERNIO_KV",
-      "id": "ff883e9f60784e1fb7ae4e0229d9c9e8"
+      "binding": "BEDAYA_KV_PROD",
+      "id": "ddbe4f4fc4be4cf3adcac516df38f2ee"
     }
   ],
   "queues": {
