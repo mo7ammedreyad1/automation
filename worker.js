@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Enterprise Social Inbox Agent (v25.0: Full Telemetry & Trace Engine)
+// Bedaya Enterprise Social Inbox Agent (v26.0: Pure Logo Header & Full Features)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -10,6 +10,7 @@ const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
+// الثوابت التشغيلية المحدثة
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
 const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
 const LOG_LIST_LIMIT = 50;
@@ -135,7 +136,7 @@ async function checkCircuitBreaker(env) {
   if (!env.ZERNIO_KV) return false;
   const trippedUntil = await env.ZERNIO_KV.get("circuit_breaker_until");
   if (trippedUntil && Date.now() < parseInt(trippedUntil, 10)) {
-    return true; // القاطع مفعل ومغلق مؤقتاً لحماية السيرفر
+    return true; // القاطع مفعل مؤقتاً لحماية السيرفر
   }
   return false;
 }
@@ -144,7 +145,6 @@ async function reportRouterFailure(env) {
   if (!env.ZERNIO_KV) return;
   const currentFailures = parseInt(await env.ZERNIO_KV.get("router_consecutive_failures") || "0", 10) + 1;
   if (currentFailures >= 3) {
-    // تفعيل قاطع الدائرة لمدة 60 ثانية
     await env.ZERNIO_KV.put("circuit_breaker_until", String(Date.now() + 60000), { expirationTtl: 120 });
     await env.ZERNIO_KV.put("router_consecutive_failures", "0", { expirationTtl: 120 });
   } else {
@@ -460,7 +460,6 @@ function extractRouterText(data) {
 }
 
 async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
-  // فحص قاطع الدائرة الذكي
   const isTripped = await checkCircuitBreaker(env);
   if (isTripped) {
     throw new Error("قاطع الدائرة مفعل مؤقتاً لحماية السيرفر (Circuit Breaker Active - Cooldown 60s)");
@@ -510,7 +509,6 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
     throw new Error(msg);
   }
 
-  // تسجيل النجاح واستخراج التوكنات
   await reportRouterSuccess(env, data.usage || null);
 
   if (attemptsLog) {
@@ -527,7 +525,7 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
   return extractRouterText(data);
 }
 
-// تحليل محتوى الملفات بالذكاء الاصطناعي وتلخيصها
+// دالة تحليل محتوى ملفات المتجر بالذكاء الاصطناعي وتلخيصها
 async function synthesizeStoreKnowledge(env, rawFileText, fileName) {
   const prompt = `أنت خبير استخراج وتلخيص المعرفة التجارية. اقرأ محتوى هذا الملف (${fileName}) واستخرج منه جميع المعلومات الهامة لخدمة العملاء (المنتجات، الأسعار، المواصفات، سياسات الشحن والضمان، والأسئلة الشائعة) في شكل قاعدة معرفة مرتبة وواضحة باللغة العربية.
 
@@ -537,7 +535,7 @@ ${rawFileText.slice(0, 15000)}
 قاعدة المعرفة الملخصة:`;
 
   const messages = [
-    { role: "system", content: "أنت خبير استخراج وتلخيص المعرفة التجارية." },
+    { role: "system", content: "أنت خبير استخراج وتلخيص المعرفة التجارية للوكلاء الذكيين." },
     { role: "user", content: prompt }
   ];
 
@@ -857,7 +855,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 2. الحسابات المتصلة
+  // 2. جلب الحسابات المتصلة
   if (method === 'GET' && path === '/api/accounts') {
     const zernioRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
     return jsonResponse(zernioRes.data, zernioRes.status);
@@ -1005,7 +1003,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Store Files)
+  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Files Synthesizer)
   if (method === 'POST' && (path === '/api/upload-file' || path === '/api/upload-rag-doc')) {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
@@ -1076,7 +1074,7 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      service: "Bedaya Enterprise Agent Engine v25.0",
+      service: "Bedaya Enterprise Agent Engine v26.0",
       model: AI_ROUTER_MODEL,
       prompt: prompt || 'البرومبت الافتراضي نشط',
       crmSchema: crmSchema || 'افتراضي',
@@ -1123,7 +1121,7 @@ async function handleApiRequests(request, env, url) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) واجهات الـ Dashboard والـ Trace والفحص (BreeAra Flat UI)
+// 9) واجهات الـ Dashboard والـ Trace (الهيدر بشعار البداية فقط في المنتصف)
 // -----------------------------------------------------------------------------
 
 async function handleTraceView(request, env, traceId) {
@@ -1134,31 +1132,24 @@ async function handleTraceView(request, env, traceId) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>سجل ${traceId} | بداية</title>
+<title>تفاصيل السجل ${traceId}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/dist/tabler-icons.min.css">
 <style>
-@font-face {
-  font-family: 'BreeAra';
-  src: url('https://cdn.jsdelivr.net/gh/mo7ammedreyad1/Assets@main/alfont_com_bree-ara-tn-trial-semibold.otf.ttf') format('truetype');
-  font-display: swap;
-}
 :root {
   --bg-workspace: #f5f5f5; --bg-surface: #ffffff; --text-primary: #0a0f1d;
   --text-secondary: #52525b; --text-muted: #8e8e93; --border: #e4e4e7;
   --border-subtle: #eeeeef; --green-bg: #ebfcd2; --green-dark: #013330;
   --error-bg: #fef2f2; --error-text: #dc2626; --radius-panel: 26px; --radius-md: 8px;
+  --brand-symbol: #383b42;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif; box-shadow: none !important; }
-html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; }
-.brand-top-header { width: 100vw; height: 8.8vh; min-height: 64px; max-height: 76px; display: flex; align-items: center; justify-content: center; padding: 1.4vh 2vw; }
-.brand-lockup { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; }
-.brand-logo-box { width: 42px; height: 42px; }
-.brand-logo-box svg { width: 100%; height: 100%; }
-.brand-text-ar { font-family: 'BreeAra', sans-serif !important; font-weight: 700; font-size: 1.75rem; color: var(--text-primary); line-height: 1.05; }
-.brand-text-en { font-family: 'BreeAra', 'Plus Jakarta Sans', sans-serif !important; font-weight: 600; font-size: 1.15rem; color: #334155; line-height: 1.05; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; align-items: center; }
+.brand-top-header { width: 100vw; height: clamp(54px, 7.8vh, 72px); display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 1.2vh 2vw; }
+.brand-logo-box { width: clamp(38px, 4.8vh, 48px); height: clamp(36px, 4.5vh, 45px); display: flex; align-items: center; justify-content: center; }
+.brand-logo-box svg { width: 100%; height: 100%; display: block; }
 .app-sheet { width: 100vw; flex: 1; background: var(--bg-surface); border-top: 1px solid var(--border); border-top-left-radius: var(--radius-panel); border-top-right-radius: var(--radius-panel); padding: 2vh 2vw 1.5vh 2vw; display: flex; flex-direction: column; overflow: hidden; }
 .sheet-nav-bar { display: flex; align-items: center; justify-content: space-between; padding-bottom: 1.5vh; margin-bottom: 1.5vh; border-bottom: 1px solid var(--border-subtle); flex-shrink: 0; }
 .back-link { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); text-decoration: none; font-size: 0.82rem; font-weight: 700; padding: 6px 12px; border-radius: var(--radius-md); border: 1px solid var(--border); background: #fafafa; }
@@ -1178,14 +1169,11 @@ html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: va
 </head>
 <body>
   <header class="brand-top-header">
-    <div class="brand-lockup">
-      <div class="brand-logo-box">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
-          <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
-          <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-        </svg>
-      </div>
-      <div class="brand-title-text"><span class="brand-text-ar">بِـدَايَــةٌ</span><span class="brand-text-en">Bedaya</span></div>
+    <div class="brand-logo-box">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
+        <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="var(--brand-symbol)" stroke="var(--brand-symbol)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+        <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="var(--brand-symbol)" stroke="var(--brand-symbol)" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
     </div>
   </header>
 
@@ -1249,7 +1237,7 @@ html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: va
 }
 
 // -----------------------------------------------------------------------------
-// 10) تصميم لوحة المتابعة الرئيسية /dashboard المعتمدة (BreeAra Flat UI)
+// 10) تصميم لوحة المتابعة الرئيسية /dashboard (شعار بداية فقط في المنتصف)
 // -----------------------------------------------------------------------------
 
 async function handleDashboard(request, env) {
@@ -1264,36 +1252,28 @@ async function handleDashboard(request, env) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>لوحة المتابعة السحابية | بداية</title>
+<title>لوحة المتابعة السحابية</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/dist/tabler-icons.min.css">
 <style>
-@font-face {
-  font-family: 'BreeAra';
-  src: url('https://cdn.jsdelivr.net/gh/mo7ammedreyad1/Assets@main/alfont_com_bree-ara-tn-trial-semibold.otf.ttf') format('truetype');
-  font-display: swap;
-}
 :root {
   --bg-workspace: #f5f5f5; --bg-surface: #ffffff; --text-primary: #0a0f1d;
   --text-secondary: #52525b; --text-muted: #8e8e93; --border: #e4e4e7;
   --border-subtle: #eeeeef; --green-bg: #ebfcd2; --green-dark: #013330;
   --error-bg: #fef2f2; --error-text: #dc2626; --blue-bg: #ebf3ff;
   --tiktok-bg: #4c0519; --tiktok-text: #fda4af; --radius-panel: 26px; --radius-lg: 10px; --radius-md: 6px;
+  --brand-symbol: #383b42;
   --transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif; box-shadow: none !important; -webkit-box-shadow: none !important; }
-html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; }
-*::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; align-items: center; }
+*::-webkit-scrollbar { width: 5px; height: 5px; background: transparent; }
 *::-webkit-scrollbar-thumb { background-color: rgba(10, 15, 29, 0.15); border-radius: 50px; }
-.brand-top-header { width: 100vw; height: 8.8vh; min-height: 64px; max-height: 76px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 1.4vh 2vw; }
-.brand-lockup { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; }
-.brand-logo-box { width: clamp(38px, 4.6vh, 46px); height: clamp(36px, 4.4vh, 44px); flex-shrink: 0; }
+.brand-top-header { width: 100vw; height: clamp(54px, 7.8vh, 72px); display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 1.2vh 2vw; }
+.brand-logo-box { width: clamp(38px, 4.8vh, 48px); height: clamp(36px, 4.5vh, 45px); display: flex; align-items: center; justify-content: center; }
 .brand-logo-box svg { width: 100%; height: 100%; display: block; }
-.brand-title-text { display: flex; flex-direction: column; text-align: right; }
-.brand-text-ar { font-family: 'BreeAra', sans-serif !important; font-weight: 700; font-size: clamp(1.55rem, 2.7vh, 1.95rem); color: var(--text-primary); line-height: 1.05; letter-spacing: -0.4px; }
-.brand-text-en { font-family: 'BreeAra', 'Plus Jakarta Sans', sans-serif !important; font-weight: 600; font-size: clamp(1.05rem, 1.8vh, 1.3rem); color: #334155; line-height: 1.05; letter-spacing: 0.5px; margin-top: 1px; }
 .app-sheet { width: 100vw; flex: 1; background: var(--bg-surface); border-top: 1px solid var(--border); border-top-left-radius: var(--radius-panel); border-top-right-radius: var(--radius-panel); border-bottom-left-radius: 0; border-bottom-right-radius: 0; padding: 2vh 1.8vw 1.2vh 1.8vw; display: flex; flex-direction: column; overflow: hidden; }
 .font-num { font-family: 'Readex Pro', sans-serif !important; }
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1vw; margin-bottom: 1.6vh; flex-shrink: 0; }
@@ -1319,14 +1299,11 @@ tr:hover td { background: #fafafc; }
 </head>
 <body>
   <header class="brand-top-header">
-    <div class="brand-lockup">
-      <div class="brand-logo-box">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
-          <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
-          <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-        </svg>
-      </div>
-      <div class="brand-title-text"><span class="brand-text-ar">بِـدَايَــةٌ</span><span class="brand-text-en">Bedaya</span></div>
+    <div class="brand-logo-box">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
+        <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="var(--brand-symbol)" stroke="var(--brand-symbol)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+        <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="var(--brand-symbol)" stroke="var(--brand-symbol)" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
     </div>
   </header>
 
@@ -1426,23 +1403,23 @@ tr:hover td { background: #fafafc; }
           const durationStr = logItem.timing?.durationMs ? logItem.timing.durationMs + ' ms' : '—';
           const actionSnippet = logItem.replyText || logItem.finalText || logItem.error || 'معالجة';
 
-          html += \`
+          html += `
             <tr>
-              <td class="font-num" style="color:var(--text-muted); font-size:0.72rem;">\${idx + 1}</td>
-              <td><code class="font-num">\${logItem.eventId || logItem.id || '---'}</code></td>
-              <td class="font-num">\${timeStr.slice(0, 19).replace('T', ' ')}</td>
-              <td><span class="pill \${platformPill}">\${platform}</span></td>
-              <td><span class="pill pill-other font-num">\${logItem.event || 'message'}</span></td>
-              <td style="font-weight:600;">\${logItem.sender?.name || logItem.accountId || 'عميل'}</td>
-              <td style="max-width:240px; overflow:hidden; text-overflow:ellipsis;" title="\${actionSnippet}">\${actionSnippet}</td>
-              <td class="font-num">\${logItem.modelUsed || 'auto'}</td>
-              <td class="font-num">\${durationStr}</td>
-              <td><span class="pill \${pillClass}">\${pillLabel}</span></td>
+              <td class="font-num" style="color:var(--text-muted); font-size:0.72rem;">${idx + 1}</td>
+              <td><code class="font-num">${logItem.eventId || logItem.id || '---'}</code></td>
+              <td class="font-num">${timeStr.slice(0, 19).replace('T', ' ')}</td>
+              <td><span class="pill ${platformPill}">${platform}</span></td>
+              <td><span class="pill pill-other font-num">${logItem.event || 'message'}</span></td>
+              <td style="font-weight:600;">${logItem.sender?.name || logItem.accountId || 'عميل'}</td>
+              <td style="max-width:240px; overflow:hidden; text-overflow:ellipsis;" title="${actionSnippet}">${actionSnippet}</td>
+              <td class="font-num">${logItem.modelUsed || 'auto'}</td>
+              <td class="font-num">${durationStr}</td>
+              <td><span class="pill ${pillClass}">${pillLabel}</span></td>
               <td>
-                <a class="btn-view" href="/dashboard/trace/\${logItem.eventId || logItem.id}"><i class="ti ti-route"></i> المسار</a>
+                <a class="btn-view" href="/dashboard/trace/${logItem.eventId || logItem.id}"><i class="ti ti-route"></i> المسار</a>
               </td>
             </tr>
-          \`;
+          `;
         });
 
         tbody.innerHTML = html;
@@ -1606,7 +1583,7 @@ export default {
           await handleZernioEvent(env, rawBody, payload, receivedAt, true);
           message.ack();
         } catch (dlqErr) {
-          console.error("DLQ Final event error:", payload?.id, dlqErr.message);
+          console.error("DLQ Emergency handled event:", payload?.id, dlqErr.message);
           if (payload?.id) {
             await kvSetJSON(env, `review:${payload.id}`, {
               eventId: payload.id,
@@ -1629,9 +1606,9 @@ export default {
         await handleZernioEvent(env, rawBody, payload, receivedAt, false);
         message.ack();
       } catch (err) {
-        console.error("Queue retry for event:", payload?.id, err.message);
+        console.error("queue consumer retry", payload && payload.id, err && err.message);
         const attempt = message.attempts || 1;
-        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800);
+        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800); // 20s, 40s, 80s... حتى 10 محاولات
         message.retry({ delaySeconds });
       }
     }
