@@ -1,5 +1,5 @@
 // =============================================================================
-// Bedaya Enterprise Social Inbox Agent (v26.0: Pure Logo Header & Full Features)
+// Bedaya Enterprise Social Inbox Agent (v26.0: Flat Minimal Centered-Logo Hub)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
@@ -10,16 +10,15 @@ const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
-// الثوابت التشغيلية المحدثة
-const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
-const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
+const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام
+const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام
 const LOG_LIST_LIMIT = 50;
 
 const MAX_AGENT_STEPS = 10;
 const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
-const AUTO_CONTEXT_LIMIT = 10; // 10 رسائل سياق لسرعة الاستجابة
+const AUTO_CONTEXT_LIMIT = 10; // سياق 10 رسائل لسرعة المعالجة
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -28,7 +27,7 @@ const corsHeaders = {
 };
 
 // -----------------------------------------------------------------------------
-// 1) دوال مساعدة عامة وتشفير
+// 1) أدوات مساعدة عامة وتشفير
 // -----------------------------------------------------------------------------
 
 function jsonResponse(obj, status = 200) {
@@ -136,7 +135,7 @@ async function checkCircuitBreaker(env) {
   if (!env.ZERNIO_KV) return false;
   const trippedUntil = await env.ZERNIO_KV.get("circuit_breaker_until");
   if (trippedUntil && Date.now() < parseInt(trippedUntil, 10)) {
-    return true; // القاطع مفعل مؤقتاً لحماية السيرفر
+    return true;
   }
   return false;
 }
@@ -525,7 +524,6 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
   return extractRouterText(data);
 }
 
-// دالة تحليل محتوى ملفات المتجر بالذكاء الاصطناعي وتلخيصها
 async function synthesizeStoreKnowledge(env, rawFileText, fileName) {
   const prompt = `أنت خبير استخراج وتلخيص المعرفة التجارية. اقرأ محتوى هذا الملف (${fileName}) واستخرج منه جميع المعلومات الهامة لخدمة العملاء (المنتجات، الأسعار، المواصفات، سياسات الشحن والضمان، والأسئلة الشائعة) في شكل قاعدة معرفة مرتبة وواضحة باللغة العربية.
 
@@ -748,7 +746,6 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt, isEmergencyR
     let rawEventText = rawBody;
     let contextFetched = null;
 
-    // فحص الملاحظات الصوتية (Voice Notes)
     const audioAttachment = (payload.message?.attachments || []).find(a => a.type === 'audio' || a.originalType === 'audio');
     if (audioAttachment && audioAttachment.url) {
       rawEventText += `\n\n[ملاحظة صوتية واردة من العميل]: مرفق ملف صوتي في الرابط: ${audioAttachment.url}`;
@@ -1003,7 +1000,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Files Synthesizer)
+  // 9. 📁 تحليل واستخراج المعرفة من ملفات المتجر بالـ AI (Store Files)
   if (method === 'POST' && (path === '/api/upload-file' || path === '/api/upload-rag-doc')) {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
@@ -1030,7 +1027,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح ملفات المتجر وقاعدة المعرفة بنجاح' });
   }
 
-  // 10. 📊 إدارة واسترجاع سجلات الـ CRM
+  // 10. 📊 إدارة واسترجاع سجلات وأعمدة الـ CRM
   if (method === 'POST' && path === '/api/set-crm-schema') {
     const body = await request.json().catch(() => ({}));
     const schema = body.schema || '';
@@ -1121,7 +1118,7 @@ async function handleApiRequests(request, env, url) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) واجهات الـ Dashboard والـ Trace (الهيدر بشعار البداية فقط في المنتصف)
+// 9) واجهات الـ Dashboard والـ Trace (الهيدر يحتوي على اللوجو فقط في المنتصف)
 // -----------------------------------------------------------------------------
 
 async function handleTraceView(request, env, traceId) {
@@ -1132,7 +1129,7 @@ async function handleTraceView(request, env, traceId) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>تفاصيل السجل ${traceId}</title>
+<title>سجل ${traceId}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
@@ -1146,9 +1143,9 @@ async function handleTraceView(request, env, traceId) {
   --brand-symbol: #383b42;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif; box-shadow: none !important; }
-html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; align-items: center; }
-.brand-top-header { width: 100vw; height: clamp(54px, 7.8vh, 72px); display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 1.2vh 2vw; }
-.brand-logo-box { width: clamp(38px, 4.8vh, 48px); height: clamp(36px, 4.5vh, 45px); display: flex; align-items: center; justify-content: center; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; }
+.brand-top-header { width: 100vw; height: clamp(52px, 7.5vh, 68px); display: flex; align-items: center; justify-content: center; padding: 0.8vh 2vw; }
+.brand-logo-box { width: clamp(36px, 4.8vh, 46px); height: clamp(34px, 4.5vh, 44px); display: flex; align-items: center; justify-content: center; }
 .brand-logo-box svg { width: 100%; height: 100%; display: block; }
 .app-sheet { width: 100vw; flex: 1; background: var(--bg-surface); border-top: 1px solid var(--border); border-top-left-radius: var(--radius-panel); border-top-right-radius: var(--radius-panel); padding: 2vh 2vw 1.5vh 2vw; display: flex; flex-direction: column; overflow: hidden; }
 .sheet-nav-bar { display: flex; align-items: center; justify-content: space-between; padding-bottom: 1.5vh; margin-bottom: 1.5vh; border-bottom: 1px solid var(--border-subtle); flex-shrink: 0; }
@@ -1168,6 +1165,7 @@ html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: va
 </style>
 </head>
 <body>
+  <!-- الهيدر يحتوي على اللوجو المعتمد فقط في المنتصف بدون نصوص -->
   <header class="brand-top-header">
     <div class="brand-logo-box">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
@@ -1236,10 +1234,6 @@ html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: va
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-// -----------------------------------------------------------------------------
-// 10) تصميم لوحة المتابعة الرئيسية /dashboard (شعار بداية فقط في المنتصف)
-// -----------------------------------------------------------------------------
-
 async function handleDashboard(request, env) {
   const url = new URL(request.url);
   if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
@@ -1264,15 +1258,15 @@ async function handleDashboard(request, env) {
   --border-subtle: #eeeeef; --green-bg: #ebfcd2; --green-dark: #013330;
   --error-bg: #fef2f2; --error-text: #dc2626; --blue-bg: #ebf3ff;
   --tiktok-bg: #4c0519; --tiktok-text: #fda4af; --radius-panel: 26px; --radius-lg: 10px; --radius-md: 6px;
-  --brand-symbol: #383b42;
   --transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  --brand-symbol: #383b42;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif; box-shadow: none !important; -webkit-box-shadow: none !important; }
-html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; align-items: center; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; }
 *::-webkit-scrollbar { width: 5px; height: 5px; background: transparent; }
 *::-webkit-scrollbar-thumb { background-color: rgba(10, 15, 29, 0.15); border-radius: 50px; }
-.brand-top-header { width: 100vw; height: clamp(54px, 7.8vh, 72px); display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 1.2vh 2vw; }
-.brand-logo-box { width: clamp(38px, 4.8vh, 48px); height: clamp(36px, 4.5vh, 45px); display: flex; align-items: center; justify-content: center; }
+.brand-top-header { width: 100vw; height: clamp(52px, 7.5vh, 68px); display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0.8vh 2vw; }
+.brand-logo-box { width: clamp(36px, 4.8vh, 46px); height: clamp(34px, 4.5vh, 44px); display: flex; align-items: center; justify-content: center; }
 .brand-logo-box svg { width: 100%; height: 100%; display: block; }
 .app-sheet { width: 100vw; flex: 1; background: var(--bg-surface); border-top: 1px solid var(--border); border-top-left-radius: var(--radius-panel); border-top-right-radius: var(--radius-panel); border-bottom-left-radius: 0; border-bottom-right-radius: 0; padding: 2vh 1.8vw 1.2vh 1.8vw; display: flex; flex-direction: column; overflow: hidden; }
 .font-num { font-family: 'Readex Pro', sans-serif !important; }
@@ -1298,6 +1292,7 @@ tr:hover td { background: #fafafc; }
 </style>
 </head>
 <body>
+  <!-- الهيدر يحتوي على اللوجو المعتمد فقط في المنتصف بدون نصوص -->
   <header class="brand-top-header">
     <div class="brand-logo-box">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
@@ -1439,69 +1434,7 @@ tr:hover td { background: #fafafc; }
 }
 
 // -----------------------------------------------------------------------------
-// 11) مسارات الـ Health والـ Review
-// -----------------------------------------------------------------------------
-
-async function handleHealth(request, env) {
-  const url = new URL(request.url);
-  if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
-    return jsonResponse({ ok: false, error: "Unauthorized." }, 401);
-  }
-
-  const apiKey = (env.ZERNIO_API_KEY || WORKER_ZERNIO_API_KEY || '').trim();
-  const secrets = {
-    ZERNIO_API_KEY: !!apiKey,
-    ZERNIO_WEBHOOK_SECRET: !!env.ZERNIO_WEBHOOK_SECRET,
-    AI_ROUTER_API_KEY: !!(env.AI_ROUTER_API_KEY || env.GEMINI_API_KEY),
-  };
-
-  let zernioRest = { connected: false };
-  try {
-    const res = await fetch(`${ZERNIO_API_BASE}/accounts?profileId=${env.ZERNIO_PROFILE_ID || WORKER_ZERNIO_PROFILE_ID}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      zernioRest = { connected: true, accountCount: ((data && data.accounts) || (Array.isArray(data) ? data : [])).length };
-    } else {
-      const errText = await res.text().catch(() => "");
-      zernioRest = { connected: false, status: res.status, error: errText.slice(0, 300) };
-    }
-  } catch (err) {
-    zernioRest = { connected: false, error: err.message };
-  }
-
-  const eventId = url.searchParams.get("eventId");
-  const since = computeSinceDate(url);
-  const logs = await listRecentLogs(env, { eventId, since });
-
-  return jsonResponse({ ok: true, secrets, zernioRest, tools: buildToolsManifest(), logs });
-}
-
-async function handleReviewQueue(request, env) {
-  const url = new URL(request.url);
-  if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
-    return jsonResponse({ ok: false, error: "Unauthorized." }, 401);
-  }
-
-  const resolveId = url.searchParams.get("resolve");
-  if (resolveId && env.ZERNIO_KV) {
-    await env.ZERNIO_KV.delete(`review:${resolveId}`).catch(() => {});
-    return jsonResponse({ ok: true, resolved: resolveId });
-  }
-
-  try {
-    const listRes = await env.ZERNIO_KV.list({ prefix: "review:", limit: 1000 });
-    const items = (await Promise.all(listRes.keys.map((k) => kvGetJSON(env, k.name)))).filter(Boolean);
-    items.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
-    return jsonResponse({ ok: true, pendingCount: items.length, items });
-  } catch (err) {
-    return jsonResponse({ ok: false, error: err.message }, 500);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// 12) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
+// 10) نقطة الدخول واستقبال الطوابير (Fetch & Queue Consumers)
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1573,9 +1506,8 @@ export default {
     }
   },
 
-  // مستهلك الطوابير (10 محاولات مع معالجة إلزامية لـ DLQ)
+  // مستهلك الطوابير (10 محاولات مع معالجة إلزامية لـ DLQ لضمان عدم سقوط أي رسالة)
   async queue(batch, env) {
-    // 1. طابور الـ Dead Letter Queue (معالجة إلزامية طارئة)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
         const { rawBody, payload, receivedAt } = message.body || {};
@@ -1599,16 +1531,15 @@ export default {
       return;
     }
 
-    // 2. الطابور الرئيسي (مع تأخير تصاعدي حتى 10 محاولات)
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
         await handleZernioEvent(env, rawBody, payload, receivedAt, false);
         message.ack();
       } catch (err) {
-        console.error("queue consumer retry", payload && payload.id, err && err.message);
+        console.error("Queue retry for event:", payload?.id, err.message);
         const attempt = message.attempts || 1;
-        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800); // 20s, 40s, 80s... حتى 10 محاولات
+        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800);
         message.retry({ delaySeconds });
       }
     }
