@@ -1,16 +1,15 @@
 // =============================================================================
-// Bedaya Enterprise Social Inbox Agent (v24.0: AI File Synthesizer & Custom CRM)
+// Bedaya Enterprise Social Inbox Agent (v25.0: Full Telemetry & Trace Engine)
 // =============================================================================
 
 const WORKER_ZERNIO_API_KEY = "sk_df7ff944e449abea14a5ea0999ea0e13afe58b5eb8e10242a3a16fbc6b37debd";
 const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
-const DEFAULT_ADMIN_KEY = "bedaya_admin_2026"; // مفتاح الآدمن الافتراضي للفرمتة
+const DEFAULT_ADMIN_KEY = "bedaya_admin_2026";
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
 const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
-// الثوابت التشغيلية المحدثة
 const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
 const AUDIT_LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 أيام كاملة
 const LOG_LIST_LIMIT = 50;
@@ -19,7 +18,7 @@ const MAX_AGENT_STEPS = 10;
 const CALL_TIMEOUT_MS = 15000;
 const AI_CALL_TIMEOUT_MS = 30000;
 const AI_ROUTER_MAX_TOKENS = 1024;
-const AUTO_CONTEXT_LIMIT = 10; // سياق 10 رسائل لسرعة المعالجة
+const AUTO_CONTEXT_LIMIT = 10; // 10 رسائل سياق لسرعة الاستجابة
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -28,7 +27,7 @@ const corsHeaders = {
 };
 
 // -----------------------------------------------------------------------------
-// 1) أدوات مساعدة عامة
+// 1) دوال مساعدة عامة وتشفير
 // -----------------------------------------------------------------------------
 
 function jsonResponse(obj, status = 200) {
@@ -129,7 +128,43 @@ function redactSecret(text, secret) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) كتالوج أدوات الوكيل (Zernio Handlers + Custom CRM + Spam Tool)
+// 2) قاطع الدائرة الذكي وإحصائيات التوكنات (Circuit Breaker & Telemetry)
+// -----------------------------------------------------------------------------
+
+async function checkCircuitBreaker(env) {
+  if (!env.ZERNIO_KV) return false;
+  const trippedUntil = await env.ZERNIO_KV.get("circuit_breaker_until");
+  if (trippedUntil && Date.now() < parseInt(trippedUntil, 10)) {
+    return true; // القاطع مفعل ومغلق مؤقتاً لحماية السيرفر
+  }
+  return false;
+}
+
+async function reportRouterFailure(env) {
+  if (!env.ZERNIO_KV) return;
+  const currentFailures = parseInt(await env.ZERNIO_KV.get("router_consecutive_failures") || "0", 10) + 1;
+  if (currentFailures >= 3) {
+    // تفعيل قاطع الدائرة لمدة 60 ثانية
+    await env.ZERNIO_KV.put("circuit_breaker_until", String(Date.now() + 60000), { expirationTtl: 120 });
+    await env.ZERNIO_KV.put("router_consecutive_failures", "0", { expirationTtl: 120 });
+  } else {
+    await env.ZERNIO_KV.put("router_consecutive_failures", String(currentFailures), { expirationTtl: 120 });
+  }
+}
+
+async function reportRouterSuccess(env, usage = null) {
+  if (!env.ZERNIO_KV) return;
+  await env.ZERNIO_KV.delete("router_consecutive_failures").catch(() => {});
+  if (usage && usage.total_tokens) {
+    const today = new Date().toISOString().split('T')[0];
+    const key = `metrics:tokens:${today}`;
+    const current = parseInt(await env.ZERNIO_KV.get(key) || "0", 10);
+    await env.ZERNIO_KV.put(key, String(current + usage.total_tokens), { expirationTtl: 30 * 86400 });
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 3) كتالوج أدوات الوكيل (Zernio Handlers + Custom CRM + Spam Tool)
 // -----------------------------------------------------------------------------
 
 async function zernioFetch(env, path, options = {}) {
@@ -143,7 +178,7 @@ async function zernioFetch(env, path, options = {}) {
   const res = await Promise.race([
     fetch(url, { ...options, headers }),
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`انتهت مهلة اتصال Zernio API (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`انتهت مهلة نداء Zernio API (${CALL_TIMEOUT_MS / 1000}s): ${path}`)), CALL_TIMEOUT_MS)
     ),
   ]);
   const bodyText = await res.text();
@@ -284,7 +319,6 @@ const CALL_HANDLERS = {
     return zernioFetch(env, `/inbox/comments/${encodeURIComponent(postId)}?${qs}`, { method: "DELETE" });
   },
 
-  // أداة تجاهل السبام والمحادثات غير المرغوبة
   async ignoreMessage(env, args) {
     const { reason = "spam", notes = "" } = args || {};
     return {
@@ -294,7 +328,6 @@ const CALL_HANDLERS = {
     };
   },
 
-  // أداة حفظ بيانات الطلب والعميل في الـ CRM
   async saveToCrm(env, args) {
     const { leadData = {} } = args || {};
     if (env.ZERNIO_KV) {
@@ -347,7 +380,7 @@ async function executeCalls(env, calls, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 3) بناء الـ System Prompt الديناميكي (الملفات المحللة + أعمدة الـ CRM)
+// 4) بناء الـ System Prompt الديناميكي (الملفات المحللة + أعمدة الـ CRM)
 // -----------------------------------------------------------------------------
 
 async function buildAgentSystemInstruction(env) {
@@ -407,7 +440,7 @@ async function buildAgentSystemInstruction(env) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) عميل الموديل ومحلل الملفات الذكي (AI Router & File Synthesizer)
+// 5) عميل الموديل ومحلل الملفات الذكي (AI Router & File Synthesizer)
 // -----------------------------------------------------------------------------
 
 function contentsToMessages(systemInstruction, contents) {
@@ -427,6 +460,12 @@ function extractRouterText(data) {
 }
 
 async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
+  // فحص قاطع الدائرة الذكي
+  const isTripped = await checkCircuitBreaker(env);
+  if (isTripped) {
+    throw new Error("قاطع الدائرة مفعل مؤقتاً لحماية السيرفر (Circuit Breaker Active - Cooldown 60s)");
+  }
+
   const messages = contentsToMessages(systemInstruction, contents);
   const url = `${AI_ROUTER_BASE}/chat/completions`;
   const apiKey = env.AI_ROUTER_API_KEY || env.GEMINI_API_KEY || WORKER_ZERNIO_API_KEY;
@@ -454,6 +493,7 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
     ]);
     bodyText = await res.text();
   } catch (err) {
+    await reportRouterFailure(env);
     const msg = `AI Router error: ${(err && err.message) || err}`;
     if (attemptsLog) attemptsLog.push({ provider: "ai-router", model: AI_ROUTER_MODEL, ok: false, note: msg });
     throw new Error(msg);
@@ -463,11 +503,15 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
   try { data = bodyText ? JSON.parse(bodyText) : {}; } catch (_) { data = { raw: bodyText.slice(0, 500) }; }
 
   if (!res.ok) {
+    await reportRouterFailure(env);
     const errMsg = data && data.error && (data.error.message || data.error) ? data.error.message || JSON.stringify(data.error) : JSON.stringify(data).slice(0, 300);
     const msg = `AI Router HTTP ${res.status}: ${errMsg}`;
     if (attemptsLog) attemptsLog.push({ provider: "ai-router", model: AI_ROUTER_MODEL, status: res.status, ok: false, note: msg });
     throw new Error(msg);
   }
+
+  // تسجيل النجاح واستخراج التوكنات
+  await reportRouterSuccess(env, data.usage || null);
 
   if (attemptsLog) {
     attemptsLog.push({
@@ -475,6 +519,7 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
       model: AI_ROUTER_MODEL,
       status: res.status,
       ok: true,
+      usage: data.usage || null,
       upstreamProvider: res.headers.get("X-AI-Router-Provider") || null,
       upstreamModel: res.headers.get("X-AI-Router-Model") || null,
     });
@@ -482,17 +527,17 @@ async function callRouterTurn(env, contents, systemInstruction, attemptsLog) {
   return extractRouterText(data);
 }
 
-// دالة تحليل واستخراج معرفة الملفات بالذكاء الاصطناعي
+// تحليل محتوى الملفات بالذكاء الاصطناعي وتلخيصها
 async function synthesizeStoreKnowledge(env, rawFileText, fileName) {
-  const prompt = `أنت خبير تحليل بيانات الأنشطة التجارية والمتاجر. قم بقراءة وفهم محتوى هذا الملف (${fileName}) واستخرج منه جميع المعلومات الأساسية للمتجر (المنتجات، الأسعار، العروض، سياسات الشحن والضمان، والأسئلة الشائعة). قم بتلخيصها وصياغتها في شكل قاعدة معرفة واضحة ومباشرة ومنظمة باللغة العربية.
+  const prompt = `أنت خبير استخراج وتلخيص المعرفة التجارية. اقرأ محتوى هذا الملف (${fileName}) واستخرج منه جميع المعلومات الهامة لخدمة العملاء (المنتجات، الأسعار، المواصفات، سياسات الشحن والضمان، والأسئلة الشائعة) في شكل قاعدة معرفة مرتبة وواضحة باللغة العربية.
 
-محتوى الملف الخام:
+محتوى الملف:
 ${rawFileText.slice(0, 15000)}
 
-قاعدة المعرفة المستخرجة:`;
+قاعدة المعرفة الملخصة:`;
 
   const messages = [
-    { role: "system", content: "أنت خبير استخراج وتلخيص المعرفة التجارية للوكلاء الذكيين." },
+    { role: "system", content: "أنت خبير استخراج وتلخيص المعرفة التجارية." },
     { role: "user", content: prompt }
   ];
 
@@ -513,7 +558,7 @@ ${rawFileText.slice(0, 15000)}
     const data = await res.json();
     return extractRouterText(data).trim();
   } catch (err) {
-    console.error("File synthesis error, fallback to raw text:", err);
+    console.error("File synthesis fallback:", err);
     return rawFileText.slice(0, 5000);
   }
 }
@@ -542,7 +587,7 @@ function extractJsonObject(text) {
 }
 
 // -----------------------------------------------------------------------------
-// 5) حلقة تفكير الوكيل (ReAct Agent Loop)
+// 6) حلقة تفكير الوكيل (ReAct Agent Loop)
 // -----------------------------------------------------------------------------
 
 async function runAgentLoopWithModel(env, rawEventText, eventId) {
@@ -635,7 +680,7 @@ async function runAgentLoop(env, rawEventText, eventId) {
 }
 
 // -----------------------------------------------------------------------------
-// 6) معالجة الأحداث الواردة (Webhook Handler)
+// 7) معالجة الأحداث الواردة (Webhook Handler)
 // -----------------------------------------------------------------------------
 
 function isSelfEcho(payload) {
@@ -670,7 +715,7 @@ function extractCommentContext(payload) {
   return postId && accountId ? { postId, accountId } : null;
 }
 
-async function handleZernioEvent(env, rawBody, payload, receivedAt) {
+async function handleZernioEvent(env, rawBody, payload, receivedAt, isEmergencyRun = false) {
   const eventId = payload.id;
   const eventType = payload.event;
   const startedAt = isoNow();
@@ -732,6 +777,10 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
       }
     }
 
+    if (isEmergencyRun) {
+      rawEventText = `[معالجة طارئة لرسالة مستنفدة في الـ DLQ — إما أن تجيب العميل أو تستدعي ignoreMessage لإغلاقها]\n\n` + rawEventText;
+    }
+
     const trace = await runAgentLoop(env, rawEventText, eventId);
 
     const finishedAt = isoNow();
@@ -784,7 +833,7 @@ async function handleZernioEvent(env, rawBody, payload, receivedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// 7) مسارات الـ API (OAuth, Files, CRM Leads, Analytics, Factory Reset)
+// 8) مسارات الـ API (OAuth, Files, CRM, Analytics, Factory Reset)
 // -----------------------------------------------------------------------------
 
 async function handleApiRequests(request, env, url) {
@@ -808,7 +857,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse(zernioRes.data, zernioRes.status);
   }
 
-  // 2. جلب الحسابات المتصلة
+  // 2. الحسابات المتصلة
   if (method === 'GET' && path === '/api/accounts') {
     const zernioRes = await zernioFetch(env, `/accounts?profileId=${PROFILE_ID}`);
     return jsonResponse(zernioRes.data, zernioRes.status);
@@ -824,7 +873,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: false, error: zernioRes.data?.error || 'فشل فصل الحساب' }, zernioRes.status);
   }
 
-  // 4. 🧹 الفرمتة الشاملة للسيرفر مع التحقق من مفتاح الآدمن (Admin Key Protected)
+  // 4. 🧹 الفرمتة الشاملة المحمية بمفتاح الآدمن (Admin Key Protected)
   if (method === 'POST' && path === '/api/admin/factory-reset') {
     const body = await request.json().catch(() => ({}));
     const providedKey = request.headers.get("X-Admin-Key") || body.adminKey || url.searchParams.get("key");
@@ -868,7 +917,7 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      message: "تمت فرمتة السيرفر وحذف جميع الحسابات وبيانات الـ KV بالكامل.",
+      message: "تمت فرمتة السيرفر ومسح كافة الحسابات وبيانات الـ KV بالكامل.",
       deletedAccountsCount: disconnectedAccounts.length,
       disconnectedAccounts,
       deletedKvKeysCount: deletedKeysCount,
@@ -956,13 +1005,12 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, prompt: prompt || 'البرومبت الافتراضي نشط' });
   }
 
-  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Files Synthesizer)
+  // 9. 📁 رفع وتحليل ملفات المتجر بالذكاء الاصطناعي (Store Files)
   if (method === 'POST' && (path === '/api/upload-file' || path === '/api/upload-rag-doc')) {
     const body = await request.json().catch(() => ({}));
     const { name, size, textContent } = body;
     if (!textContent) return jsonResponse({ error: 'محتوى الملف مفقود' }, 400);
 
-    // تحليل واستخراج المعرفة من الملف بالـ AI Router
     const structuredKnowledge = await synthesizeStoreKnowledge(env, textContent, name || "مستند المتجر");
 
     if (env.ZERNIO_KV) {
@@ -984,7 +1032,7 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, message: 'تم مسح ملفات المتجر وقاعدة المعرفة بنجاح' });
   }
 
-  // 10. 📊 إدارة واسترجاع بيانات الـ CRM
+  // 10. 📊 إدارة واسترجاع سجلات الـ CRM
   if (method === 'POST' && path === '/api/set-crm-schema') {
     const body = await request.json().catch(() => ({}));
     const schema = body.schema || '';
@@ -997,7 +1045,6 @@ async function handleApiRequests(request, env, url) {
     return jsonResponse({ ok: true, schema: schema || 'الاسم، رقم الهاتف، العنوان، المنتج المطلوب' });
   }
 
-  // استرجاع كافة الطلبات والعملاء المسجلين في الـ CRM
   if (method === 'GET' && path === '/api/crm/leads') {
     if (!env.ZERNIO_KV) return jsonResponse({ ok: true, count: 0, leads: [] });
     try {
@@ -1029,7 +1076,7 @@ async function handleApiRequests(request, env, url) {
 
     return jsonResponse({
       ok: true,
-      service: "Bedaya Enterprise Agent Engine v24.0",
+      service: "Bedaya Enterprise Agent Engine v25.0",
       model: AI_ROUTER_MODEL,
       prompt: prompt || 'البرومبت الافتراضي نشط',
       crmSchema: crmSchema || 'افتراضي',
@@ -1076,45 +1123,347 @@ async function handleApiRequests(request, env, url) {
 }
 
 // -----------------------------------------------------------------------------
-// 8) استقبال الـ Webhook و /health و /dashboard
+// 9) واجهات الـ Dashboard والـ Trace والفحص (BreeAra Flat UI)
 // -----------------------------------------------------------------------------
 
-async function handleWebhook(request, env) {
-  const receivedAt = isoNow();
-  const rawBody = await request.text();
+async function handleTraceView(request, env, traceId) {
+  const logData = await kvGetJSON(env, `audit_log_${traceId}`) || (await listRecentLogs(env, { eventId: traceId }))[0];
 
-  await logActivity(env, {
-    event: "webhook-received",
-    outcome: "arrived",
-    timing: { receivedAt },
-    hasSignatureHeader: !!request.headers.get("X-Zernio-Signature"),
-    bodyPreview: rawBody.length > 200 ? rawBody.slice(0, 200) + "…" : rawBody,
-  });
-
-  const signature = request.headers.get("X-Zernio-Signature");
-  if (signature && env.ZERNIO_WEBHOOK_SECRET) {
-    const computed = await hmacSha256Hex(env.ZERNIO_WEBHOOK_SECRET, rawBody);
-    if (!safeEqualHex(computed, signature)) {
-      await logActivity(env, { event: "webhook", outcome: "rejected-bad-signature", timing: { receivedAt } });
-      return textResponse("Invalid signature", 400);
-    }
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch (err) {
-    await logActivity(env, { event: "webhook", outcome: "rejected-invalid-json", error: err.message, timing: { receivedAt } });
-    return textResponse("Invalid JSON body", 400);
-  }
-
-  // إيداع الحدث مباشرة في طابور Cloudflare Queues بدون فحص Dedup
-  if (env.EVENTS_QUEUE) {
-    await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
-  }
-
-  return jsonResponse({ ok: true, queued: true });
+  const html = `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>سجل ${traceId} | بداية</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/dist/tabler-icons.min.css">
+<style>
+@font-face {
+  font-family: 'BreeAra';
+  src: url('https://cdn.jsdelivr.net/gh/mo7ammedreyad1/Assets@main/alfont_com_bree-ara-tn-trial-semibold.otf.ttf') format('truetype');
+  font-display: swap;
 }
+:root {
+  --bg-workspace: #f5f5f5; --bg-surface: #ffffff; --text-primary: #0a0f1d;
+  --text-secondary: #52525b; --text-muted: #8e8e93; --border: #e4e4e7;
+  --border-subtle: #eeeeef; --green-bg: #ebfcd2; --green-dark: #013330;
+  --error-bg: #fef2f2; --error-text: #dc2626; --radius-panel: 26px; --radius-md: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif; box-shadow: none !important; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; }
+.brand-top-header { width: 100vw; height: 8.8vh; min-height: 64px; max-height: 76px; display: flex; align-items: center; justify-content: center; padding: 1.4vh 2vw; }
+.brand-lockup { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; }
+.brand-logo-box { width: 42px; height: 42px; }
+.brand-logo-box svg { width: 100%; height: 100%; }
+.brand-text-ar { font-family: 'BreeAra', sans-serif !important; font-weight: 700; font-size: 1.75rem; color: var(--text-primary); line-height: 1.05; }
+.brand-text-en { font-family: 'BreeAra', 'Plus Jakarta Sans', sans-serif !important; font-weight: 600; font-size: 1.15rem; color: #334155; line-height: 1.05; }
+.app-sheet { width: 100vw; flex: 1; background: var(--bg-surface); border-top: 1px solid var(--border); border-top-left-radius: var(--radius-panel); border-top-right-radius: var(--radius-panel); padding: 2vh 2vw 1.5vh 2vw; display: flex; flex-direction: column; overflow: hidden; }
+.sheet-nav-bar { display: flex; align-items: center; justify-content: space-between; padding-bottom: 1.5vh; margin-bottom: 1.5vh; border-bottom: 1px solid var(--border-subtle); flex-shrink: 0; }
+.back-link { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); text-decoration: none; font-size: 0.82rem; font-weight: 700; padding: 6px 12px; border-radius: var(--radius-md); border: 1px solid var(--border); background: #fafafa; }
+.sheet-scroll-content { flex: 1; overflow-y: auto; padding-left: 6px; }
+.meta-chip { background: #fafafa; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 6px 12px; font-size: 0.78rem; color: var(--text-secondary); display: inline-flex; gap: 6px; margin: 4px; }
+.pill { display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 100px; font-size: 0.72rem; font-weight: 700; }
+.pill-success { background-color: var(--green-bg); color: var(--green-dark); }
+.pill-failed { background-color: var(--error-bg); color: var(--error-text); }
+.detail-card { background: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.detail-card-title { font-size: 0.86rem; font-weight: 800; margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+.trace-item { display: flex; gap: 12px; margin-bottom: 10px; }
+.trace-bullet { width: 9px; height: 9px; border-radius: 50%; margin-top: 7px; flex-shrink: 0; background: #cbd5e1; }
+.trace-bullet-err { background: var(--error-text); }
+.trace-box { flex: 1; background: #ffffff; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; }
+.trace-json { font-family: 'Plus Jakarta Sans', monospace !important; font-size: 0.75rem; color: var(--text-secondary); background: #fafafa; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-subtle); white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+  <header class="brand-top-header">
+    <div class="brand-lockup">
+      <div class="brand-logo-box">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
+          <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+          <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="brand-title-text"><span class="brand-text-ar">بِـدَايَــةٌ</span><span class="brand-text-en">Bedaya</span></div>
+    </div>
+  </header>
+
+  <main class="app-sheet">
+    <div class="sheet-nav-bar">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <a href="/dashboard" class="back-link"><i class="ti ti-arrow-right"></i> رجوع للوحة المتابعة</a>
+        <span style="font-size:1.05rem; font-weight:800;">تفاصيل مسار الحدث <code>${traceId}</code></span>
+      </div>
+      <span class="pill ${logData?.outcome === 'final' || logData?.status === 'completed' ? 'pill-success' : 'pill-failed'}">${logData?.outcome || logData?.status || 'معالجة'}</span>
+    </div>
+
+    <div class="sheet-scroll-content">
+      <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px;">
+        <span class="meta-chip">المعرف: <strong>${traceId}</strong></span>
+        <span class="meta-chip">الوقت: <strong>${(logData?.timing?.receivedAt || logData?.createdAt || isoNow()).replace('T', ' ').slice(0, 19)}</strong></span>
+        <span class="meta-chip">المنصة: <strong>${logData?.platform || 'Meta / TikTok'}</strong></span>
+        <span class="meta-chip">المدة: <strong>${logData?.timing?.durationMs ? logData.timing.durationMs + ' ms' : '—'}</strong></span>
+      </div>
+
+      <div class="detail-card">
+        <div class="detail-card-title"><i class="ti ti-message"></i> تفاصيل الرسالة الواردة</div>
+        <div style="font-size:0.84rem; color:var(--text-secondary); line-height:1.6;">
+          المرسل: <strong>${logData?.sender?.name || 'عميل'}</strong><br>
+          النص: "${logData?.incomingText || logData?.trigger?.preview || '---'}"
+        </div>
+      </div>
+
+      <div class="detail-card">
+        <div class="detail-card-title"><i class="ti ti-route"></i> مسار التنفيذ التفصيلي (Execution Trace)</div>
+        <div class="trace-item">
+          <div class="trace-bullet"></div>
+          <div class="trace-box">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-weight:700; font-size:0.8rem;">
+              <span>REQUEST_RECEIVED</span>
+              <span style="color:var(--text-muted); font-size:0.72rem;">${logData?.timing?.receivedAt || isoNow()}</span>
+            </div>
+            <pre class="trace-json">${JSON.stringify({ event: logData?.event, id: traceId }, null, 2)}</pre>
+          </div>
+        </div>
+
+        ${(logData?.steps || logData?.workflow || []).map((st, i) => `
+          <div class="trace-item">
+            <div class="trace-bullet ${st.type === 'invalid-json' || st.ok === false ? 'trace-bullet-err' : ''}"></div>
+            <div class="trace-box">
+              <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-weight:700; font-size:0.8rem;">
+                <span>${st.step || st.name || `STEP_${i+1}`} (${st.type || 'EXECUTION'})</span>
+                <span style="color:var(--text-muted); font-size:0.72rem;">${st.time || st.ts || ''}</span>
+              </div>
+              <pre class="trace-json">${JSON.stringify(st, null, 2)}</pre>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  </main>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// -----------------------------------------------------------------------------
+// 10) تصميم لوحة المتابعة الرئيسية /dashboard المعتمدة (BreeAra Flat UI)
+// -----------------------------------------------------------------------------
+
+async function handleDashboard(request, env) {
+  const url = new URL(request.url);
+  if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
+    return textResponse("Unauthorized.", 401);
+  }
+  const keyQs = env.STATUS_KEY ? `?key=${encodeURIComponent(url.searchParams.get("key"))}` : "";
+
+  const html = `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>لوحة المتابعة السحابية | بداية</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/dist/tabler-icons.min.css">
+<style>
+@font-face {
+  font-family: 'BreeAra';
+  src: url('https://cdn.jsdelivr.net/gh/mo7ammedreyad1/Assets@main/alfont_com_bree-ara-tn-trial-semibold.otf.ttf') format('truetype');
+  font-display: swap;
+}
+:root {
+  --bg-workspace: #f5f5f5; --bg-surface: #ffffff; --text-primary: #0a0f1d;
+  --text-secondary: #52525b; --text-muted: #8e8e93; --border: #e4e4e7;
+  --border-subtle: #eeeeef; --green-bg: #ebfcd2; --green-dark: #013330;
+  --error-bg: #fef2f2; --error-text: #dc2626; --blue-bg: #ebf3ff;
+  --tiktok-bg: #4c0519; --tiktok-text: #fda4af; --radius-panel: 26px; --radius-lg: 10px; --radius-md: 6px;
+  --transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif; box-shadow: none !important; -webkit-box-shadow: none !important; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background-color: var(--bg-workspace); color: var(--text-primary); display: flex; flex-direction: column; }
+*::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+*::-webkit-scrollbar-thumb { background-color: rgba(10, 15, 29, 0.15); border-radius: 50px; }
+.brand-top-header { width: 100vw; height: 8.8vh; min-height: 64px; max-height: 76px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 1.4vh 2vw; }
+.brand-lockup { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; }
+.brand-logo-box { width: clamp(38px, 4.6vh, 46px); height: clamp(36px, 4.4vh, 44px); flex-shrink: 0; }
+.brand-logo-box svg { width: 100%; height: 100%; display: block; }
+.brand-title-text { display: flex; flex-direction: column; text-align: right; }
+.brand-text-ar { font-family: 'BreeAra', sans-serif !important; font-weight: 700; font-size: clamp(1.55rem, 2.7vh, 1.95rem); color: var(--text-primary); line-height: 1.05; letter-spacing: -0.4px; }
+.brand-text-en { font-family: 'BreeAra', 'Plus Jakarta Sans', sans-serif !important; font-weight: 600; font-size: clamp(1.05rem, 1.8vh, 1.3rem); color: #334155; line-height: 1.05; letter-spacing: 0.5px; margin-top: 1px; }
+.app-sheet { width: 100vw; flex: 1; background: var(--bg-surface); border-top: 1px solid var(--border); border-top-left-radius: var(--radius-panel); border-top-right-radius: var(--radius-panel); border-bottom-left-radius: 0; border-bottom-right-radius: 0; padding: 2vh 1.8vw 1.2vh 1.8vw; display: flex; flex-direction: column; overflow: hidden; }
+.font-num { font-family: 'Readex Pro', sans-serif !important; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1vw; margin-bottom: 1.6vh; flex-shrink: 0; }
+.card { background: #fafafa; border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 1.4vh 1.2vw; transition: var(--transition); }
+.card .label { color: var(--text-muted); font-size: clamp(0.7rem, 1.25vh, 0.8rem); font-weight: 600; margin-bottom: 0.4vh; display: flex; align-items: center; justify-content: space-between; }
+.card .value { font-size: clamp(1.25rem, 2.4vh, 1.55rem); font-weight: 800; color: var(--text-primary); }
+.actions-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 1.2vh; flex-shrink: 0; }
+.table-wrap { flex: 1; overflow-y: auto; overflow-x: auto; background: #ffffff; border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); position: relative; }
+table { width: 100%; border-collapse: collapse; min-width: 980px; font-size: clamp(0.75rem, 1.35vh, 0.83rem); }
+th { text-align: right; padding: 1.3vh 1vw; color: var(--text-secondary); background: #f8fafc; font-weight: 700; white-space: nowrap; border-bottom: 1px solid var(--border-subtle); position: sticky; top: 0; z-index: 5; }
+td { padding: 1.15vh 1vw; border-top: 1px solid var(--border-subtle); white-space: nowrap; }
+tr:hover td { background: #fafafc; }
+.pill { display: inline-flex; align-items: center; padding: 0.35vh 0.7vw; border-radius: 100px; font-size: clamp(0.66rem, 1.15vh, 0.73rem); font-weight: 700; white-space: nowrap; }
+.pill-success { background-color: var(--green-bg); color: var(--green-dark); }
+.pill-failed { background-color: var(--error-bg); color: var(--error-text); }
+.pill-other { background-color: #f4f4f5; color: var(--text-secondary); border: 1px solid var(--border); }
+.pill-tiktok { background-color: var(--tiktok-bg); color: var(--tiktok-text); }
+.pill-meta { background-color: var(--blue-bg); color: #1e3a8a; }
+.btn-view { display: inline-flex; align-items: center; gap: 5px; padding: 0.5vh 0.8vw; border-radius: var(--radius-md); border: 1px solid var(--border); background: #ffffff; color: var(--text-primary); text-decoration: none; font-size: clamp(0.7rem, 1.2vh, 0.77rem); font-weight: 600; transition: var(--transition); }
+.btn-view:hover { background-color: #f4f4f5; border-color: #d4d4d8; }
+@media (max-width: 800px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .app-sheet { padding: 1.6vh 2.5vw 1vh 2.5vw; border-top-left-radius: 20px; border-top-right-radius: 20px; } }
+</style>
+</head>
+<body>
+  <header class="brand-top-header">
+    <div class="brand-lockup">
+      <div class="brand-logo-box">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
+          <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+          <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#0a0f1d" stroke="#0a0f1d" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="brand-title-text"><span class="brand-text-ar">بِـدَايَــةٌ</span><span class="brand-text-en">Bedaya</span></div>
+    </div>
+  </header>
+
+  <main class="app-sheet">
+    <section class="stats">
+      <div class="card">
+        <div class="label"><span>بوابة Zernio</span><span class="pill pill-success" id="zernio-pill">متصل</span></div>
+        <div class="value font-num" id="stat-accounts">3 حسابات</div>
+      </div>
+      <div class="card">
+        <div class="label"><span>طابور المعالجة</span><span class="pill pill-success">Queues + DLQ</span></div>
+        <div class="value font-num">10 محاولات</div>
+      </div>
+      <div class="card">
+        <div class="label"><span>المحادثات المكتملة</span><span class="pill pill-other font-num">7 أيام</span></div>
+        <div class="value font-num" id="stat-completed">--</div>
+      </div>
+      <div class="card">
+        <div class="label"><span>حالة الراوتر والذكاء</span><span class="pill pill-other">AI Router</span></div>
+        <div class="value font-num" style="font-size: 1.15rem; color: #4338ca;">auto (Gemini/Groq)</div>
+      </div>
+    </section>
+
+    <section class="actions-bar">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:0.84rem; font-weight:700;">تدفق الرسائل المباشرة</span>
+        <span class="pill pill-other font-num" id="live-timer">تحديث: 5s</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span class="pill pill-meta">Meta (FB & IG)</span>
+        <span class="pill pill-tiktok">TikTok Business</span>
+        <a href="/health${keyQs}" class="btn-view"><i class="ti ti-activity"></i> فحص السيرفر</a>
+      </div>
+    </section>
+
+    <section class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Event ID</th>
+            <th>الوقت</th>
+            <th>المنصة</th>
+            <th>الحدث</th>
+            <th>المرسل / الحساب</th>
+            <th>الإجراء والرد</th>
+            <th>الموديل</th>
+            <th>المدة</th>
+            <th>الحالة</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="logs-tbody">
+          <tr><td colspan="11" style="text-align:center; padding:20px; color:var(--text-muted);">جاري استدعاء البيانات الحية...</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const tbody = document.getElementById('logs-tbody');
+
+    async function loadDashboardData() {
+      try {
+        const res = await fetch('/api/audit-logs');
+        const data = await res.json();
+        const logs = data.logs || [];
+
+        if (logs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="11" style="text-align:center; padding:20px; color:var(--text-muted);">لا توجد أحداث مسجلة في السيرفر حالياً.</td></tr>';
+          return;
+        }
+
+        let html = '';
+        let completedCount = 0;
+
+        logs.forEach((logItem, idx) => {
+          const outcome = logItem.outcome || 'final';
+          if (outcome === 'final' || outcome === 'completed') completedCount++;
+
+          let pillClass = 'pill-other';
+          let pillLabel = outcome;
+          if (outcome === 'final' || outcome === 'completed') {
+            pillClass = 'pill-success';
+            pillLabel = 'تم الرد';
+          } else if (outcome === 'error' || outcome === 'internal-error' || outcome === 'max-steps') {
+            pillClass = 'pill-failed';
+            pillLabel = 'تعثر';
+          } else if (outcome === 'dead-lettered') {
+            pillClass = 'pill-failed';
+            pillLabel = 'DLQ';
+          }
+
+          const platform = logItem.platform || (logItem.trigger && logItem.trigger.platform) || 'meta';
+          const platformPill = platform === 'tiktok' ? 'pill-tiktok' : 'pill-meta';
+          const timeStr = logItem.timing?.receivedAt || logItem.createdAt || '---';
+          const durationStr = logItem.timing?.durationMs ? logItem.timing.durationMs + ' ms' : '—';
+          const actionSnippet = logItem.replyText || logItem.finalText || logItem.error || 'معالجة';
+
+          html += \`
+            <tr>
+              <td class="font-num" style="color:var(--text-muted); font-size:0.72rem;">\${idx + 1}</td>
+              <td><code class="font-num">\${logItem.eventId || logItem.id || '---'}</code></td>
+              <td class="font-num">\${timeStr.slice(0, 19).replace('T', ' ')}</td>
+              <td><span class="pill \${platformPill}">\${platform}</span></td>
+              <td><span class="pill pill-other font-num">\${logItem.event || 'message'}</span></td>
+              <td style="font-weight:600;">\${logItem.sender?.name || logItem.accountId || 'عميل'}</td>
+              <td style="max-width:240px; overflow:hidden; text-overflow:ellipsis;" title="\${actionSnippet}">\${actionSnippet}</td>
+              <td class="font-num">\${logItem.modelUsed || 'auto'}</td>
+              <td class="font-num">\${durationStr}</td>
+              <td><span class="pill \${pillClass}">\${pillLabel}</span></td>
+              <td>
+                <a class="btn-view" href="/dashboard/trace/\${logItem.eventId || logItem.id}"><i class="ti ti-route"></i> المسار</a>
+              </td>
+            </tr>
+          \`;
+        });
+
+        tbody.innerHTML = html;
+        document.getElementById('stat-completed').textContent = completedCount;
+      } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="11" style="text-align:center; padding:20px; color:var(--error-text);">خطأ في استدعاء السجلات السحابية.</td></tr>';
+      }
+    }
+
+    loadDashboardData();
+    setInterval(loadDashboardData, 5000);
+  </script>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// -----------------------------------------------------------------------------
+// 11) مسارات الـ Health والـ Review
+// -----------------------------------------------------------------------------
 
 async function handleHealth(request, env) {
   const url = new URL(request.url);
@@ -1175,137 +1524,7 @@ async function handleReviewQueue(request, env) {
 }
 
 // -----------------------------------------------------------------------------
-// 9) تصميم صفحة الـ /dashboard المعتمدة (#f5f5f5 + اللوجو في المنتصف بالأعلى)
-// -----------------------------------------------------------------------------
-
-async function handleDashboard(request, env) {
-  const url = new URL(request.url);
-  if (env.STATUS_KEY && url.searchParams.get("key") !== env.STATUS_KEY) {
-    return textResponse("Unauthorized.", 401);
-  }
-  const keyQs = env.STATUS_KEY ? `?key=${encodeURIComponent(url.searchParams.get("key"))}` : "";
-
-  const html = `<!DOCTYPE html>
-<html dir="rtl" lang="ar">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>بِـدَايَــةٌ | غرفة المراقبة السحابية (Live Monitor)</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg-page: #f5f5f5;
-    --bg-card: #ffffff;
-    --text-pri: #010101;
-    --text-sec: #555555;
-    --text-muted: #8e8e93;
-    --border-color: #e5e5e5;
-    --green-bg: #ebfcd2;
-    --green-text: #013330;
-    --green-border: #b4f0a0;
-    --red-bg: #fef2f2;
-    --red-text: #dc2626;
-    --radius-workspace: 18px;
-    --radius-sm: 6px;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Readex Pro', sans-serif !important; box-shadow: none !important; -webkit-box-shadow: none !important; }
-  body { background-color: var(--bg-page); color: var(--text-pri); min-height: 100vh; padding: 0 6px 6px 6px; display: flex; flex-direction: column; align-items: center; }
-  .top-centered-brand { width: 100%; padding: 24px 0 16px 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
-  .logo-box-center { width: 50px; height: 50px; display: flex; align-items: center; justify-content: center; }
-  .logo-box-center svg { width: 100%; height: 100%; }
-  .workspace-container { width: 100%; max-width: 1050px; flex: 1; background-color: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-workspace); padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; margin-bottom: 2px; }
-  .status-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--border-color); }
-  .pills-group { display: flex; gap: 8px; flex-wrap: wrap; }
-  .pill { background-color: #f5f5f5; border: 1px solid var(--border-color); border-radius: 50px; padding: 5px 12px; font-size: 0.76rem; font-weight: 600; color: var(--text-sec); display: inline-flex; align-items: center; gap: 6px; }
-  .pill-ok { background-color: var(--green-bg); color: var(--green-text); border-color: var(--green-border); }
-  .stream-section { display: flex; flex-direction: column; gap: 12px; }
-  .stream-header { display: flex; align-items: center; justify-content: space-between; font-size: 0.88rem; font-weight: 700; color: var(--text-pri); }
-  .logs-list { display: flex; flex-direction: column; gap: 8px; }
-  .log-row { background-color: #ffffff; border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
-  .log-row-top { display: flex; align-items: center; justify-content: space-between; font-size: 0.78rem; }
-  .event-label { font-weight: 700; color: var(--text-pri); }
-  .badge-outcome { padding: 2px 8px; border-radius: var(--radius-sm); font-size: 0.7rem; font-weight: 700; }
-  .badge-final { background-color: var(--green-bg); color: var(--green-text); }
-  .badge-err { background-color: var(--red-bg); color: var(--red-text); }
-  .badge-skip { background-color: #f5f5f5; color: var(--text-muted); }
-  .log-body-text { font-size: 0.82rem; color: var(--text-sec); line-height: 1.55; background-color: #fafafa; border: 1px solid #f0f0f0; padding: 8px 10px; border-radius: var(--radius-sm); }
-</style>
-</head>
-<body>
-  <header class="top-centered-brand">
-    <div class="logo-box-center">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 95">
-        <path d="m88.7 8.6c-4.5-4.1-9.7-6.6-17.1-7.5h-41.1c-6.5 0-12.5 1.6-17.3 5.5s-11.1 10.3-11.1 21.4v25.3c0 9.7 4.9 18.7 13.4 24.7l-3.1 12.3c-0.5 2.5 2.1 4.4 4.2 3.2l19.7-10.2h32.7c13.9 0 29-11.9 29-29.6v-25.5c-0.2-7.2-3.6-14.7-9.3-19.6zm4.1 44.2c0 13.1-9.8 24.9-24.4 24.9h-32.8c-0.5 0-0.9 0.2-1.3 0.4l-15.1 7.9 2.2-8.1c0.4-1.7-0.4-2.9-1.3-3.4-2.4-1.2-4.3-2.9-6.1-4.8-3.6-4.1-6-9.8-6.8-16.4v-24.7c0-11.7 10.4-22.1 21.4-22.1h42.5c10.6 0 21.7 9 21.7 22.3z" fill="#010101" stroke="#010101" stroke-width="2.7" stroke-linejoin="round" stroke-linecap="round"/>
-        <path d="m67.7 51c-1.1 1.1-7.3 5.9-16.7 6.3s-15.9-4.4-17.8-6c-1.3-1.3-3-1.5-4.3-0.3-1.1 1.1-1.3 3.1 0.4 4.2 4.5 3.5 10.5 7.2 20.6 7.2 7.3 0 13.8-2.2 18.2-5.1 3.3-2.3 4-2.8 4-4.4 0-1.9-2.1-3.5-4.2-2.1z" fill="#010101" stroke="#010101" stroke-width="2.0" stroke-linejoin="round" stroke-linecap="round"/>
-      </svg>
-    </div>
-  </header>
-
-  <main class="workspace-container">
-    <section class="status-bar">
-      <div class="pills-group" id="stats-pills"></div>
-      <div id="live-clock" style="font-size:0.74rem; color:var(--text-muted); font-weight:600;">جاري التحميل...</div>
-    </section>
-
-    <section class="stream-section">
-      <div class="stream-header">
-        <span>سجل الرسائل والأحداث الواردة (Live Event Stream)</span>
-        <span id="events-count" style="font-size:0.75rem; color:var(--text-muted);">سجل 7 أيام</span>
-      </div>
-      <div class="logs-list" id="logs-container"></div>
-    </section>
-  </main>
-
-  <script>
-  async function refresh() {
-    try {
-      const res = await fetch('/health${keyQs}');
-      const data = await res.json();
-      document.getElementById('live-clock').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar-EG');
-      const zc = data.zernioRest && data.zernioRest.connected;
-      document.getElementById('stats-pills').innerHTML =
-        '<span class="pill ' + (zc ? 'pill-ok' : 'pill-err') + '">Zernio: ' + (zc ? '🟢 متصل' : '🔴 غير متصل') + '</span>' +
-        '<span class="pill">الحسابات: ' + ((data.zernioRest && data.zernioRest.accountCount) || 0) + '</span>' +
-        '<span class="pill">طابور المعالجة: نشط</span>' +
-        '<span class="pill">مدة السجل: 7 أيام</span>';
-
-      const logsEl = document.getElementById('logs-container');
-      const items = data.logs || [];
-      document.getElementById('events-count').textContent = items.length + ' حدث مسجل';
-      logsEl.innerHTML = items.map(function(e) {
-        const outcome = e.outcome || '';
-        let badgeClass = 'badge-skip';
-        if (outcome === 'final') badgeClass = 'badge-final';
-        else if (outcome === 'error' || outcome === 'max-steps') badgeClass = 'badge-err';
-
-        return '<div class="log-row">' +
-          '<div class="log-row-top">' +
-            '<span class="event-label">' + esc(e.event || '') + ' — ' + esc(e.eventId || '') + '</span>' +
-            '<span class="badge-outcome ' + badgeClass + '">' + esc(outcome) + '</span>' +
-          '</div>' +
-          '<div style="font-size:0.74rem; color:var(--text-muted);">' + esc((e.timing && e.timing.receivedAt) || '') + (e.timing && typeof e.timing.durationMs === 'number' ? ' • ' + e.timing.durationMs + 'ms' : '') + '</div>' +
-          (e.finalText ? '<div class="log-body-text">' + esc(e.finalText) + '</div>' : '') +
-          (e.error ? '<div class="log-body-text" style="color:#dc2626;">' + esc(e.error) + '</div>' : '') +
-        '</div>';
-      }).join('') || '<div style="text-align:center; padding:16px; color:var(--text-muted);">لا توجد أحداث مسجلة بعد</div>';
-    } catch (err) {
-      document.getElementById('live-clock').textContent = 'فشل المزامنة: ' + err.message;
-    }
-  }
-  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-  refresh();
-  setInterval(refresh, 5000);
-  </script>
-</body>
-</html>`;
-
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-}
-
-// -----------------------------------------------------------------------------
-// 10) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
+// 12) نقطة الدخول ومستهلك الطوابير (Fetch & Queue Consumers)
 // -----------------------------------------------------------------------------
 
 export default {
@@ -1322,11 +1541,44 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/webhook/zernio") {
-        return await handleWebhook(request, env);
+        const receivedAt = isoNow();
+        const rawBody = await request.text();
+
+        await logActivity(env, {
+          event: "webhook-received",
+          outcome: "arrived",
+          timing: { receivedAt },
+          hasSignatureHeader: !!request.headers.get("X-Zernio-Signature"),
+          bodyPreview: rawBody.length > 200 ? rawBody.slice(0, 200) + "…" : rawBody,
+        });
+
+        const signature = request.headers.get("X-Zernio-Signature");
+        if (signature && env.ZERNIO_WEBHOOK_SECRET) {
+          const computed = await hmacSha256Hex(env.ZERNIO_WEBHOOK_SECRET, rawBody);
+          if (!safeEqualHex(computed, signature)) {
+            await logActivity(env, { event: "webhook", outcome: "rejected-bad-signature", timing: { receivedAt } });
+            return textResponse("Invalid signature", 400);
+          }
+        }
+
+        let payload;
+        try { payload = JSON.parse(rawBody); } 
+        catch (err) { return textResponse("Invalid JSON body", 400); }
+
+        if (env.EVENTS_QUEUE) {
+          await env.EVENTS_QUEUE.send({ rawBody, payload, receivedAt });
+        }
+
+        return jsonResponse({ ok: true, queued: true });
       }
 
-      if (request.method === "GET" && url.pathname === "/webhook/zernio") {
-        return textResponse("Zernio webhook endpoint — جاهز لاستقبال الأحداث.");
+      if (request.method === "GET" && url.pathname.startsWith("/dashboard/trace/")) {
+        const traceId = url.pathname.split("/dashboard/trace/")[1];
+        return await handleTraceView(request, env, traceId);
+      }
+
+      if (request.method === "GET" && url.pathname === "/dashboard") {
+        return await handleDashboard(request, env);
       }
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
@@ -1337,29 +1589,24 @@ export default {
         return await handleReviewQueue(request, env);
       }
 
-      if (request.method === "GET" && url.pathname === "/dashboard") {
-        return await handleDashboard(request, env);
-      }
-
       return textResponse("Not found", 404);
     } catch (err) {
       console.error("Unhandled fetch error", err);
-      await logActivity(env, { event: "webhook", outcome: "fatal-error", error: err.message, timing: { receivedAt: isoNow() } }).catch(() => {});
       return jsonResponse({ ok: false, error: err.message }, 500);
     }
   },
 
-  // مستهلك الطوابير (معالجة إلزامية لـ DLQ لضمان عدم سقوط أي رسالة)
+  // مستهلك الطوابير (10 محاولات مع معالجة إلزامية لـ DLQ)
   async queue(batch, env) {
-    // 1. طابور الـ Dead Letter Queue (معالجة طارئة للرسائل المتعثرة)
+    // 1. طابور الـ Dead Letter Queue (معالجة إلزامية طارئة)
     if (batch.queue && batch.queue.endsWith("-dlq")) {
       for (const message of batch.messages) {
         const { rawBody, payload, receivedAt } = message.body || {};
         try {
-          await handleZernioEvent(env, rawBody, payload, receivedAt);
+          await handleZernioEvent(env, rawBody, payload, receivedAt, true);
           message.ack();
         } catch (dlqErr) {
-          console.error("DLQ Emergency handled event:", payload?.id, dlqErr.message);
+          console.error("DLQ Final event error:", payload?.id, dlqErr.message);
           if (payload?.id) {
             await kvSetJSON(env, `review:${payload.id}`, {
               eventId: payload.id,
@@ -1375,16 +1622,16 @@ export default {
       return;
     }
 
-    // 2. الطابور الرئيسي مع تأخير تصاعدي (10 محاولات)
+    // 2. الطابور الرئيسي (مع تأخير تصاعدي حتى 10 محاولات)
     for (const message of batch.messages) {
       const { rawBody, payload, receivedAt } = message.body || {};
       try {
-        await handleZernioEvent(env, rawBody, payload, receivedAt);
+        await handleZernioEvent(env, rawBody, payload, receivedAt, false);
         message.ack();
       } catch (err) {
-        console.error("queue consumer retry", payload && payload.id, err && err.message);
+        console.error("Queue retry for event:", payload?.id, err.message);
         const attempt = message.attempts || 1;
-        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800); // 20s, 40s, 80s... حتى 10 محاولات
+        const delaySeconds = Math.min(20 * Math.pow(2, attempt - 1), 1800);
         message.retry({ delaySeconds });
       }
     }
