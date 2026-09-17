@@ -7,7 +7,7 @@ const WORKER_ZERNIO_PROFILE_ID = "6a8caec32b562566622cf28d";
 const DEFAULT_ADMIN_KEY = "bedaya_admin_2026";
 
 const ZERNIO_API_BASE = "https://zernio.com/api/v1";
-const AI_ROUTER_BASE = "https://ai.nckalo018.workers.dev/v1";
+const AI_ROUTER_BASE = "https://ai.bedaya.workers.dev/v1";
 const AI_ROUTER_MODEL = "auto";
 
 
